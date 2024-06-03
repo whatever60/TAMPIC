@@ -7,13 +7,30 @@ from scipy.stats import multivariate_normal
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms as T
 import pytorch_lightning as pl
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from tqdm.auto import tqdm
+from rich import print as rprint
 
 from affine_transform import get_query2target_func
+from crop_image import crop_image
+
+
+class _HSINormalize(T.Normalize):
+    def __init__(self, mean: list[float], std: list[float]):
+        super().__init__(mean, std)
+        self._to_tensor = T.ToTensor()
+
+    def __call__(self, **kwargs):
+        img = kwargs["image"]
+        dropout = kwargs["hsi_channel_dropout"]
+        mean = np.array(self.mean)
+        std = np.array(self.std)
+        img = (img - mean[dropout]) / std[dropout]
+        return {"image": self._to_tensor(img)}
 
 
 class GroupTransform:
@@ -21,80 +38,159 @@ class GroupTransform:
         self,
         channel_stats: dict[str, dict[str, float]],
         crop_size: int | dict[str, int],
+        _calc_stats_mode: bool = False,
     ):
-        self.crop_size = crop_size
         if isinstance(crop_size, int):
             crop_size = {"rgb-red": crop_size, "rgb-white": crop_size, "hsi": crop_size}
+        self.crop_size = crop_size
 
-        # Geometric transformations applied per modality
-        self.geom_transforms = {
-            "rgb-red": A.Compose(
-                [
-                    A.RandomCrop(width=crop_size, height=crop_size, p=0.5),
-                    A.HorizontalFlip(p=0.5),
-                    A.Rotate(limit=30, p=0.5),
-                ],
-                additional_targets={"target_mask": "image"},
-            ),
-            "rgb-white": A.Compose(
-                [
-                    A.RandomCrop(width=crop_size, height=crop_size, p=0.5),
-                    A.HorizontalFlip(p=0.5),
-                    A.Rotate(limit=30, p=0.5),
-                ],
-                additional_targets={"target_mask": "image"},
-            ),
-            "hsi": A.Compose(
-                [
-                    A.RandomCrop(width=crop_size, height=crop_size, p=0.5),
-                    A.HorizontalFlip(p=0.5),
-                    A.Rotate(limit=30, p=0.5),
-                ],
-                additional_targets={"target_mask": "image"},
-            ),
-        }
+        if not _calc_stats_mode:
+            # Geometric transformations applied per modality
+            self.geom_transforms = {
+                "rgb-red": A.Compose(
+                    [
+                        A.RandomCrop(
+                            width=crop_size["rgb-red"],
+                            height=crop_size["rgb-red"],
+                            p=0.5,
+                        ),
+                        A.HorizontalFlip(p=0.5),
+                        A.Rotate(limit=30, p=0.5),
+                        A.Resize(crop_size["rgb-red"], crop_size["rgb-red"]),
+                    ],
+                    additional_targets={"target_mask": "image"},
+                ),
+                "rgb-white": A.Compose(
+                    [
+                        A.RandomCrop(
+                            width=crop_size["rgb-white"],
+                            height=crop_size["rgb-white"],
+                            p=0.5,
+                        ),
+                        A.HorizontalFlip(p=0.5),
+                        A.Rotate(limit=30, p=0.5),
+                        A.Resize(crop_size["rgb-white"], crop_size["rgb-white"]),
+                    ],
+                    additional_targets={"target_mask": "image"},
+                ),
+                "hsi": A.Compose(
+                    [
+                        A.RandomCrop(
+                            width=crop_size["hsi"], height=crop_size["hsi"], p=1
+                        ),
+                        A.HorizontalFlip(p=0.5),
+                        # A.Rotate(limit=30, p=0.5),
+                        # A.Resize(crop_size["hsi"], crop_size["hsi"]),
+                    ],
+                    additional_targets={"target_mask": "image"},
+                ),
+            }
 
-        # Color transformations are specific to each modality
-        self.color_transforms = {
-            "rgb-red": A.Compose(
-                [
-                    A.ColorJitter(
-                        brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.75
-                    ),
-                    A.Normalize(
-                        mean=channel_stats["rgb-red"]["mean"],
-                        std=channel_stats["rgb-red"]["std"],
-                    ),
-                    ToTensorV2(),
-                ]
-            ),
-            "rgb-white": A.Compose(
-                [
-                    A.ColorJitter(
-                        brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.75
-                    ),
-                    A.Normalize(
-                        mean=channel_stats["rgb-white"]["mean"],
-                        std=channel_stats["rgb-white"]["std"],
-                    ),
-                    ToTensorV2(),
-                ]
-            ),
-            "hsi": A.Compose(
-                [
-                    A.Normalize(
-                        mean=channel_stats["hsi"]["mean"],
-                        std=channel_stats["hsi"]["std"],
-                    ),
-                    ToTensorV2(),
-                ]
-            ),
-        }
+            # Color transformations are specific to each modality
+            self.color_transforms = {
+                "rgb-red": A.Compose(
+                    [
+                        A.ColorJitter(
+                            brightness=0.3,
+                            contrast=0.3,
+                            saturation=0.3,
+                            hue=0.1,
+                            p=0.75,
+                        ),
+                        A.Normalize(
+                            mean=channel_stats["rgb-red"]["mean"],
+                            std=channel_stats["rgb-red"]["std"],
+                        ),
+                        ToTensorV2(),
+                    ]
+                ),
+                "rgb-white": A.Compose(
+                    [
+                        A.ColorJitter(
+                            brightness=0.3,
+                            contrast=0.3,
+                            saturation=0.3,
+                            hue=0.1,
+                            p=0.75,
+                        ),
+                        A.Normalize(
+                            mean=channel_stats["rgb-white"]["mean"],
+                            std=channel_stats["rgb-white"]["std"],
+                        ),
+                        ToTensorV2(),
+                    ]
+                ),
+                # "hsi": A.Compose(
+                #     [
+                #         _HSINormalize(
+                #             mean=channel_stats["hsi"]["mean"],
+                #             std=channel_stats["hsi"]["std"],
+                #         ),
+                #         ToTensorV2(),
+                #     ]
+                # ),
+                "hsi": _HSINormalize(
+                    mean=channel_stats["hsi"]["mean"],
+                    std=channel_stats["hsi"]["std"],
+                ),
+            }
+        else:  # no augmentation except for resize and to tensor
+            self.geom_transforms = {
+                "rgb-red": A.Compose(
+                    [
+                        A.HorizontalFlip(p=0),
+                    ],
+                    additional_targets={"target_mask": "image"},
+                ),
+                "rgb-white": A.Compose(
+                    [
+                        A.HorizontalFlip(p=0),
+                    ],
+                    additional_targets={"target_mask": "image"},
+                ),
+                "hsi": A.Compose(
+                    [
+                        A.HorizontalFlip(p=0),
+                    ],
+                    additional_targets={"target_mask": "image"},
+                ),
+            }
+            self.color_transforms = {
+                "rgb-red": A.Compose(
+                    [
+                        A.Normalize(
+                            mean=np.zeros_like(
+                                channel_stats["rgb-red"]["mean"]
+                            ).tolist(),
+                            std=np.ones_like(channel_stats["rgb-red"]["std"]).tolist(),
+                        ),
+                        ToTensorV2(),
+                    ]
+                ),
+                "rgb-white": A.Compose(
+                    [
+                        A.Normalize(
+                            mean=np.zeros_like(
+                                channel_stats["rgb-white"]["mean"]
+                            ).tolist(),
+                            std=np.ones_like(
+                                channel_stats["rgb-white"]["std"]
+                            ).tolist(),
+                        ),
+                        ToTensorV2(),
+                    ]
+                ),
+                "hsi": _HSINormalize(
+                    mean=np.zeros_like(channel_stats["hsi"]["mean"]).tolist(),
+                    std=np.ones_like(channel_stats["hsi"]["std"]).tolist(),
+                ),
+            }
 
     def __call__(
         self,
-        images: dict[str, np.ndarray],
-        target_masks: dict[str, np.ndarray],
+        # images: dict[str, np.ndarray],
+        # target_masks: dict[str, np.ndarray],
+        data: dict[str, np.ndarray],
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """
         Apply geometric and color transformations to the images.
@@ -106,23 +202,44 @@ class GroupTransform:
         Returns:
             dict[str, np.ndarray]: Transformed images for each modality group.
         """
-        transformed_images = {}
-        transformed_target_masks = {}
+        # transformed_images = {}
+        # transformed_target_masks = {}
+        data_aug = {}
 
-        for modality, img in images.items():
-            # Combine image and target mask
-            data = {"image": img, "target_mask": target_masks[modality]}
-            augmented = self.geom_transforms[modality](**data)
+        for modality, data_m in data.items():
+            img = data_m["image"]
+            target_mask = data_m["target_mask"]
+            augmented = self.geom_transforms[modality](
+                image=img, target_mask=target_mask
+            )
 
             # Apply color transformation to the image only
-            color_transformed_image = self.color_transforms[modality](
-                image=augmented["image"]
-            )["image"]
+            if modality == "hsi":
+                image_transformed = self.color_transforms[modality](
+                    image=augmented["image"],
+                    hsi_channel_dropout=data_m["hsi_channel_dropout"],
+                )["image"]
+                image_full = torch.zeros(
+                    (len(data_m["hsi_channel_dropout"]), *image_transformed.shape[1:])
+                )
+                image_full[data_m["hsi_channel_dropout"]] += image_transformed
+                data_aug[modality] = {
+                    "image": image_full,
+                    "target_mask": torch.from_numpy(augmented["target_mask"]).float(),
+                    "hsi_channel_dropout": torch.from_numpy(
+                        data_m["hsi_channel_dropout"]
+                    ),
+                }
+            else:
+                image_transformed = self.color_transforms[modality](
+                    image=augmented["image"]
+                )["image"]
+                data_aug[modality] = {
+                    "image": image_transformed,
+                    "target_mask": torch.from_numpy(augmented["target_mask"]).float(),
+                }
 
-            transformed_images[modality] = color_transformed_image
-            transformed_target_masks[modality] = augmented["target_mask"]
-
-        return transformed_images, transformed_target_masks
+        return data_aug
 
 
 class ImageDataset(Dataset):
@@ -138,6 +255,7 @@ class ImageDataset(Dataset):
         # size of image patch after augmentation, i.e, network input
         crop_size_final: int | dict[str, int],
         hsi_wavelengths: np.ndarray,
+        _calc_stats_mode: bool = False,
     ):
         """
         Initialize the dataset with the given parameters.
@@ -151,12 +269,18 @@ class ImageDataset(Dataset):
         """
         self.df = df
         self.target_mask_kernel_size = target_mask_kernel_size
+        if isinstance(crop_size_init, int):
+            crop_size_init = {k: crop_size_init for k in self.image_groups}
         self.crop_size_init = crop_size_init
+        if isinstance(crop_size_final, int):
+            crop_size_final = {k: crop_size_final for k in self.image_groups}
         self.crop_size_final = crop_size_final
         self.hsi_wavelengths = hsi_wavelengths
 
         self.transform = GroupTransform(
-            channel_stats=channel_stats, crop_size=crop_size_final
+            channel_stats=channel_stats,
+            crop_size=crop_size_final,
+            _calc_stats_mode=_calc_stats_mode,
         )
 
     def __len__(self) -> int:
@@ -202,18 +326,18 @@ class ImageDataset(Dataset):
         # coords = row[["coord_x", "coord_y"]].to_numpy()
         coords_rgb = row[["coord_x_rgb", "coord_y_rgb"]].to_numpy()
         coords_hsi = row[["coord_x_hsi", "coord_y_hsi"]].to_numpy()
-        images = {}
-        target_masks = {}
+        data = {}
 
         for ig in row["rand_chosen_igs"]:
             # Both groups of rgb-red and rgb-white only have one image and therefore
             # no image dropout is needed.
+            crop_size_init = self.crop_size_init[ig]
             if ig == "hsi":
                 # 0 means a channel is dropped out, 1 means kept.
                 hsi_channel_dropout = row["rand_channel_dropout_hsi"]
                 # For efficiency in cropping and augmentation, we stack all the images
                 # that are not dropped in HSI group.
-                img = self._crop_image(
+                img = crop_image(
                     np.dstack(
                         [
                             np.array(
@@ -221,53 +345,68 @@ class ImageDataset(Dataset):
                                     os.path.join(
                                         row["rand_image_hsi_path"], f"{wl}.png"
                                     )
-                                ).convert("I")
+                                )
                             )
-                            for wl in range(self.hsi_wavelengths[hsi_channel_dropout])
+                            for wl in self.hsi_wavelengths[hsi_channel_dropout]
                         ]
                     ),
-                    coords_hsi,
+                    center=coords_hsi,
+                    crop_size=crop_size_init,
                 )
             else:
-                img = self._crop_image(
+                img = crop_image(
                     np.array(Image.open(row[f"rand_image_{ig}_path"]).convert("RGB")),
-                    coords_rgb,
+                    center=coords_rgb,
+                    crop_size=crop_size_init,
                 )
-                target_mask = gaussian_image(coords_rgb)
-            if isinstance(self.crop_size_init, dict):
-                crop_size_init = self.crop_size_init[ig]
-            else:
-                crop_size_init = self.crop_size_init
             target_mask = gaussian_image(
-                position=(
-                    crop_size_init / 2,
-                    crop_size_init / 2,
-                ),
+                positions=(crop_size_init / 2, crop_size_init / 2),
                 shape=(crop_size_init, crop_size_init),
                 fwhm=self.target_mask_kernel_size,
             )
-            images[ig] = img
-            target_masks[ig] = target_mask
+            data_m = {"image": img, "target_mask": target_mask}
+            if ig == "hsi":
+                data_m["hsi_channel_dropout"] = hsi_channel_dropout
+            data[ig] = data_m
 
-        imgs_aug, target_masks_aug = self.transform(images, target_masks)
+        data_aug = self.transform(data)
 
-        # post processing for HSI group
-        if "hsi" in imgs_aug:
-            if isinstance(self.crop_size_final, dict):
-                crop_size_final = self.crop_size_final["hsi"]
+        # post processing to give collate_fn a easier time
+        for ig in self.image_groups:
+            if ig in data_aug:
+                data_aug[ig]["dropped"] = False
+                data_aug[ig]["available"] = True
+                data_aug[ig]["time_point"] = row[f"rand_image_{ig}_tp"]
+                data_aug[ig]["time_points"] = ",".join(
+                    map(str, row["image_groups_info"][ig].keys())
+                )
             else:
-                crop_size_final = self.crop_size_final
-            imgs_aug_hsi = torch.zeros(
-                (self.hsi_wavelengths, crop_size_final, crop_size_final)
-            )
-            imgs_aug_hsi[hsi_channel_dropout] += imgs_aug["hsi"]
-            imgs_aug["hsi"] = imgs_aug_hsi
+                if ig == "hsi":
+                    shape = (
+                        len(self.hsi_wavelengths),
+                        self.crop_size_final[ig],
+                        self.crop_size_final[ig],
+                    )
+                else:
+                    shape = (3, self.crop_size_final[ig], self.crop_size_final[ig])
+                data_aug[ig] = {
+                    "image": torch.zeros(*shape),
+                    "target_mask": torch.zeros(*shape[1:]),
+                    "time_point": -999,
+                    "time_points": "",
+                }
+                if ig == "hsi":
+                    data_aug[ig]["hsi_channel_dropout"] = torch.zeros(
+                        len(self.hsi_wavelengths), dtype=bool
+                    )
+                if ig in row["image_groups_info"]:
+                    data_aug[ig]["dropped"] = True
+                    data_aug[ig]["available"] = True
+                else:
+                    data_aug[ig]["dropped"] = False
+                    data_aug[ig]["available"] = False
 
-        return {
-            "images": imgs_aug,
-            "target_masks": target_masks_aug,
-            "label": row["label"],
-        }
+        return {"data": data_aug, "label": row["label"]}
 
     @staticmethod
     def _crop_image(
@@ -427,6 +566,8 @@ class TampicDataModule(pl.LightningDataModule):
         batch_size: int,
         num_workers: int,
         num_batches_per_epoch: Optional[int] = None,
+        #
+        _calc_stats_mode: bool = False,
     ):
         """
         Initialize the data module with the given parameters.
@@ -488,9 +629,9 @@ class TampicDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_batches_per_epoch = num_batches_per_epoch
         self.num_workers = num_workers
-        # self.train_df = None
-        # self.val_df_1 = None
-        # self.val_df_2 = None
+
+        # others
+        self._calc_stats_mode = _calc_stats_mode
 
     def setup(self, stage: Optional[str] = None):
         """
@@ -524,10 +665,12 @@ class TampicDataModule(pl.LightningDataModule):
         df_train = self._set_randomness(df_train)
         train_dataset = ImageDataset(
             df=df_train,
+            channel_stats=self.stats,
             target_mask_kernel_size=self.target_mask_kernel_size,
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
-            num_hsi_channels=self.num_hsi_channels,
+            hsi_wavelengths=self.hsi_wavelengths,
+            _calc_stats_mode=self._calc_stats_mode,
         )
 
         return DataLoader(
@@ -546,6 +689,7 @@ class TampicDataModule(pl.LightningDataModule):
         """
         val_dataset_1 = ImageDataset(
             df=self.df_val_easy,
+            channel_stats=self.stats,
             target_mask_kernel_size=self.target_mask_kernel_size,
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
@@ -554,6 +698,7 @@ class TampicDataModule(pl.LightningDataModule):
 
         val_dataset_2 = ImageDataset(
             df=self.df_val_mid,
+            channel_stats=self.stats,
             target_mask_kernel_size=self.target_mask_kernel_size,
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
@@ -583,7 +728,9 @@ class TampicDataModule(pl.LightningDataModule):
 
         Args:
             metadata (dict): JSON metadata.
-            split (str): Split type ('train' or 'val').
+            split (str): Split type ('train' or 'val'). This random seed stands alone
+                from the rest of the random components, so that the split is controled
+                independently.
 
         Returns:
             pd.DataFrame: DataFrame with precomputed project, plate, and image information.
@@ -625,10 +772,12 @@ class TampicDataModule(pl.LightningDataModule):
                         if k != "default" and v["status"] == "valid"
                     }
                     image_groups_info["rgb-red"] = {
-                        k: os.path.join(metadata_dir, proj, v["red"]) for k, v in time_points_rgb.items()
+                        k: os.path.join(metadata_dir, proj, v["red"])
+                        for k, v in time_points_rgb.items()
                     }
                     image_groups_info["rgb-white"] = {
-                        k: os.path.join(metadata_dir, proj, v["white"]) for k, v in time_points_rgb.items()
+                        k: os.path.join(metadata_dir, proj, v["white"])
+                        for k, v in time_points_rgb.items()
                     }
                     transform_info = meta_plate["isolate_transform"]["to_rgb"]
                     func_transform_iso2rgb = get_query2target_func(
@@ -649,6 +798,8 @@ class TampicDataModule(pl.LightningDataModule):
                     }
                     image_groups_info["hsi"] = time_points_hsi
                 for isolate, meta_isolate in amplicon_info[plate].items():
+                    if self.amplicon_type not in meta_isolate:
+                        continue
                     label = get_isolate_label(
                         meta_isolate[self.amplicon_type],
                         self.min_counts,
@@ -681,6 +832,8 @@ class TampicDataModule(pl.LightningDataModule):
                             "split": meta_plate["split"][self.amplicon_type],
                         }
                     )
+                if not rows:
+                    continue
                 df_plate = pd.DataFrame(rows)
                 # transform isolate coords on to the frame of RGB.
                 # We assume all samples have RGB images.
@@ -759,6 +912,7 @@ class TampicDataModule(pl.LightningDataModule):
         df["label_clean_idx"] = df["label"].apply(
             lambda x: self.label_clean2idx.get(x, self.label_clean2idx["others"])
         )
+        df = df.query("label_clean_idx != 'impure' and label_clean_idx != 'ambiguous'")
         if not self.keep_others:
             df = df.query("label_clean_idx != 'others'")
         if not self.keep_empty:
@@ -813,14 +967,21 @@ class TampicDataModule(pl.LightningDataModule):
         Returns:
             pd.DataFrame: Sampled DataFrame.
         """
+        num_batches_per_epoch_max = len(df) // (self.batch_size * self.num_devices)
+        if self.num_batches_per_epoch <= 0:
+            # set num batches per epoch as big as possible
+            self._num_batches_per_epoch = num_batches_per_epoch_max
+        else:
+            self._num_batches_per_epoch = self.num_batches_per_epoch
         self.epoch_length = (
-            self.num_batches_per_epoch * self.batch_size * self.num_devices
+            self._num_batches_per_epoch * self.batch_size * self.num_devices
         )
         if self.epoch_length > len(df):
-            raise ValueError(
+            rprint(
                 f"Epoch length ({self.epoch_length}) exceeds the length of the DataFrame "
-                f"({len(df)}). This is not supported."
+                f"({len(df)}). Reset to the maximum possible value ({num_batches_per_epoch_max})."
             )
+            self._num_batches_per_epoch = num_batches_per_epoch_max
         sampled_df = df.sample(
             n=self.epoch_length,
             replace=False,
@@ -830,11 +991,11 @@ class TampicDataModule(pl.LightningDataModule):
         # in pytorch ddp, samples are first split into devices and then to batches,
         # like [d1_b1, d1_b2, d1_b3, d2_b1, d2_b2, d2_b3, ...]
         sampled_df["batch_idx"] = np.tile(
-            np.repeat(np.arange(self.num_batches_per_epoch), self.batch_size),
+            np.repeat(np.arange(self._num_batches_per_epoch), self.batch_size),
             self.num_devices,
         )
         sampled_df["device_idx"] = np.repeat(
-            np.arange(self.num_devices), self.batch_size * self.num_batches_per_epoch
+            np.arange(self.num_devices), self.batch_size * self._num_batches_per_epoch
         )
         return sampled_df
 
@@ -899,11 +1060,9 @@ class TampicDataModule(pl.LightningDataModule):
                         **transform_info["stats"],
                         flip=transform_info["flip"],
                     )
-                    df.loc[j, ["rand_coord_x_hsi", "rand_coord_y_hsi"]] = (
-                        func_transform(
-                            df.loc[j:j, ["coord_x_rgb", "coord_y_rgb"]].to_numpy()
-                        )[0]
-                    )
+                    df.loc[j, ["coord_x_hsi", "coord_y_hsi"]] = func_transform(
+                        df.loc[j:j, ["coord_x_rgb", "coord_y_rgb"]].to_numpy()
+                    )[0]
                     # 1 are kept, 0 are dropped.
                     channel_dropout_mask = np.zeros(self.num_hsi_channels, dtype=bool)
                     channel_dropout_mask[
@@ -975,40 +1134,192 @@ def get_isolate_label(
     return ret
 
 
+def recursive_inspect(item):
+    if isinstance(item, dict):
+        return {k: recursive_inspect(v) for k, v in item.items()}
+    elif isinstance(item, list):
+        if not any(isinstance(v, (dict, list)) for v in item):
+            return recursive_inspect(np.array(item))
+        else:
+            return [recursive_inspect(v) for v in item]
+    else:
+        try:
+            shape = item.shape
+        except AttributeError:
+            shape = 'N/A'
+
+        try:
+            dtype = item.dtype
+        except AttributeError:
+            dtype = 'N/A'
+
+        return {
+            'type': str(type(item)),
+            'dtype': str(dtype),
+            'shape': shape
+        }
+
+
 if __name__ == "__main__":
-    base_dir = "/mnt/c/aws_data/data/camii"
-    for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
-        dm = TampicDataModule(
-            metadata_train_path=f"{base_dir}/all_0531.json",
-            weight_by_label=True,
-            weight_by_density=False,
-            weight_density_kernel_size=50,
-            weight_by_plate=False,
-            # p_num_igs=None,
-            # p_igs=None,
-            p_last_time_point=0.6,
-            p_hsi_channels=0.3,
-            rng_seed=42,
-            amplicon_type="16s",
-            taxon_level=taxon_level,
-            min_counts=10,
-            min_counts_dominate=0,
-            min_ratio=2,
-            min_num_isolates=30,
-            keep_empty=True,
-            keep_others=True,
-            crop_size_init=128,
-            crop_size_final=128,
-            target_mask_kernel_size=5,
-            num_devices=2,
-            batch_size=8,
-            num_workers=4,
-            num_batches_per_epoch=50,
-        )
-        dm.setup()
-        dataset_train = dm.train_dataloader()
-        sample = dataset_train[0]
+    import argparse
+    import time
 
-        import pdb
+    parser = argparse.ArgumentParser()
 
-        pdb.set_trace()
+    # add subparsers for test and calc_stats
+    # test subcommmand test data loading pipeline and time to setup data module and
+    # load one sample
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    parser_test = subparsers.add_parser("test")
+    parser_calc_stats = subparsers.add_parser("calc_stats")
+
+    args = parser.parse_args()
+
+    if args.command == "test":
+        base_dir = "/mnt/c/aws_data/data/camii"
+        base_dir = "/home/ubuntu/data/camii"
+        for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
+            t0 = time.perf_counter()
+            dm = TampicDataModule(
+                metadata_train_path=f"{base_dir}/all_0531.json",
+                weight_by_label=True,
+                weight_by_density=False,
+                weight_density_kernel_size=50,
+                weight_by_plate=False,
+                # p_num_igs=None,
+                # p_igs=None,
+                p_last_time_point=0.6,
+                p_hsi_channels=0.3,
+                rng_seed=42,
+                amplicon_type=amplicon_type,
+                taxon_level=taxon_level,
+                min_counts=10,
+                min_counts_dominate=0,
+                min_ratio=2,
+                min_num_isolates=30,
+                keep_empty=True,
+                keep_others=True,
+                crop_size_init={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
+                crop_size_final=96,
+                target_mask_kernel_size=5,
+                num_devices=2,
+                batch_size=8,
+                num_workers=1,
+                num_batches_per_epoch=50,
+            )
+            dm.setup()
+            dl_train = dm.train_dataloader()
+            t1 = time.perf_counter()
+            rprint(f"Time to setup data module: {t1 - t0:.2f} s")
+            first_sample = next(iter(dl_train))
+            t2 = time.perf_counter()
+            rprint(f"Time to load first sample: {t2 - t1:.2f} s")
+            shape = recursive_inspect(first_sample)
+            print(json.dumps(shape, indent=4))
+            ts = [t2]
+            for i, batch in enumerate(tqdm(dl_train)):
+                ts.append(time.perf_counter())
+            rprint(
+                f"Time to load one batch: {np.mean(np.diff(ts)):.2f} s, with batch "
+                f"size = {dm.batch_size}, num_workers = {dm.num_workers}, p_hsichannels = {dm.p_hsi_channels}"
+            )
+    elif args.command == "calc_stats":
+        # in this subcommand, we calculate the mean and std of each channel.
+        # No data augmentation or image group dropout or hsi channel dropout is applied
+        # in this subcommand. All samples have the same sampling weight. Empty
+        # isolates are not kept. All other configurations remain tha same, such
+        # as time point selection and crop size.
+        base_dir = "/mnt/c/aws_data/data/camii"
+        base_dir = "/home/ubuntu/data/camii"
+        for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
+            if amplicon_type == "16s":
+                continue
+            dm = TampicDataModule(
+                metadata_train_path=f"{base_dir}/all_0531.json",
+                weight_by_label=False,
+                weight_by_density=False,
+                weight_density_kernel_size=50,
+                weight_by_plate=False,
+                p_num_igs={1: 0, 2: 0, 3: 1},
+                # p_igs=None,
+                p_last_time_point=0.6,
+                p_hsi_channels=1,
+                rng_seed=42,
+                amplicon_type=amplicon_type,
+                taxon_level=taxon_level,
+                min_counts=10,
+                min_counts_dominate=0,
+                min_ratio=2,
+                min_num_isolates=30,
+                keep_empty=False,
+                keep_others=True,
+                crop_size_init={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
+                crop_size_final={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
+                target_mask_kernel_size=5,
+                num_devices=1,
+                batch_size=4,
+                num_workers=12,
+                num_batches_per_epoch=-1,
+                _calc_stats_mode=True,
+            )
+            dm.setup()
+            dl_train = dm.train_dataloader()
+
+            num_channels_rgb_red = 3
+            num_channels_rgb_white = 3
+            num_channels_hsi = dm.num_hsi_channels
+            # Initialize variables for mean and std calculations for each channel
+            rgb_red_sum = torch.zeros(num_channels_rgb_red)
+            rgb_red_sum_sq = torch.zeros(num_channels_rgb_red)
+            rgb_white_sum = torch.zeros(num_channels_rgb_white)
+            rgb_white_sum_sq = torch.zeros(num_channels_rgb_white)
+            hsi_sum = torch.zeros(num_channels_hsi)
+            hsi_sum_sq = torch.zeros(num_channels_hsi)
+            n_rgb_red = torch.zeros(num_channels_rgb_red)
+            n_rgb_white = torch.zeros(num_channels_rgb_white)
+            n_hsi = torch.zeros(num_channels_hsi)
+
+            # Iterate over the batches
+            for batch in tqdm(dl_train):
+                rgb_red_images = batch["data"]["rgb-red"]["image"]
+                rgb_white_images = batch["data"]["rgb-white"]["image"]
+                hsi_images = batch["data"]["hsi"]["image"]
+                rgb_red_dropped = batch["data"]["rgb-red"]["dropped"]
+                rgb_white_dropped = batch["data"]["rgb-white"]["dropped"]
+                hsi_dropped = batch["data"]["hsi"]["dropped"]
+
+                for i in range(len(rgb_red_images)):
+                    if not rgb_red_dropped[i]:
+                        rgb_red_img = rgb_red_images[i]
+                        rgb_red_sum += rgb_red_img.sum(dim=(1, 2))
+                        rgb_red_sum_sq += (rgb_red_img**2).sum(dim=(1, 2))
+                        n_rgb_red += rgb_red_img[0].numel()
+
+                    if not rgb_white_dropped[i]:
+                        rgb_white_img = rgb_white_images[i]
+                        rgb_white_sum += rgb_white_img.sum(dim=(1, 2))
+                        rgb_white_sum_sq += (rgb_white_img**2).sum(dim=(1, 2))
+                        n_rgb_white += rgb_white_img[0].numel()
+
+                    if not hsi_dropped[i]:
+                        hsi_img = hsi_images[i]
+                        hsi_sum += hsi_img.sum(dim=(1, 2))
+                        hsi_sum_sq += (hsi_img**2).sum(dim=(1, 2))
+                        n_hsi += hsi_img[0].numel()
+
+            # Calculate mean and standard deviation
+            rgb_red_mean = rgb_red_sum / n_rgb_red
+            rgb_red_std = torch.sqrt((rgb_red_sum_sq / n_rgb_red) - (rgb_red_mean**2))
+
+            rgb_white_mean = rgb_white_sum / n_rgb_white
+            rgb_white_std = torch.sqrt(
+                (rgb_white_sum_sq / n_rgb_white) - (rgb_white_mean**2)
+            )
+
+            hsi_mean = hsi_sum / n_hsi
+            hsi_std = torch.sqrt((hsi_sum_sq / n_hsi) - (hsi_mean**2))
+
+            import pdb
+
+            pdb.set_trace()
