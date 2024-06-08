@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -8,18 +9,20 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms as T
-import pytorch_lightning as pl
+import lightning as L
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import cv2 as cv
 from PIL import Image
 from tqdm.auto import tqdm
 from rich import print as rprint
+from joblib import Parallel, delayed
 
 from affine_transform import get_query2target_func
 from crop_image import crop_image
 
 
-class _HSINormalize(T.Normalize):
+class _HSINormalize(A.Normalize):
     def __init__(self, mean: list[float], std: list[float]):
         super().__init__(mean, std)
         self._to_tensor = T.ToTensor()
@@ -38,6 +41,7 @@ class GroupTransform:
         self,
         channel_stats: dict[str, dict[str, float]],
         crop_size: int | dict[str, int],
+        split: str = "train",
         _calc_stats_mode: bool = False,
     ):
         if isinstance(crop_size, int):
@@ -49,54 +53,99 @@ class GroupTransform:
             self.geom_transforms = {
                 "rgb-red": A.Compose(
                     [
-                        A.RandomCrop(
+                        A.RandomResizedCrop(
                             width=crop_size["rgb-red"],
                             height=crop_size["rgb-red"],
-                            p=0.5,
+                            scale=(0.4, 1),
                         ),
                         A.HorizontalFlip(p=0.5),
-                        A.Rotate(limit=30, p=0.5),
-                        A.Resize(crop_size["rgb-red"], crop_size["rgb-red"]),
+                        A.VerticalFlip(p=0.5),
+                        A.Rotate(limit=20, p=0.5),
                     ],
                     additional_targets={"target_mask": "image"},
                 ),
                 "rgb-white": A.Compose(
                     [
-                        A.RandomCrop(
+                        A.RandomResizedCrop(
                             width=crop_size["rgb-white"],
                             height=crop_size["rgb-white"],
-                            p=0.5,
+                            scale=(0.4, 1),
                         ),
                         A.HorizontalFlip(p=0.5),
-                        A.Rotate(limit=30, p=0.5),
-                        A.Resize(crop_size["rgb-white"], crop_size["rgb-white"]),
+                        A.VerticalFlip(p=0.5),
+                        A.Rotate(limit=20, p=0.5),
                     ],
                     additional_targets={"target_mask": "image"},
                 ),
                 "hsi": A.Compose(
                     [
-                        A.RandomCrop(
-                            width=crop_size["hsi"], height=crop_size["hsi"], p=1
+                        A.RandomResizedCrop(
+                            width=crop_size["hsi"],
+                            height=crop_size["hsi"],
+                            scale=(0.4, 1),
                         ),
                         A.HorizontalFlip(p=0.5),
-                        # A.Rotate(limit=30, p=0.5),
-                        # A.Resize(crop_size["hsi"], crop_size["hsi"]),
+                        A.VerticalFlip(p=0.5),
+                        A.Rotate(limit=20, p=0.5),
                     ],
                     additional_targets={"target_mask": "image"},
                 ),
             }
 
             # Color transformations are specific to each modality
-            self.color_transforms = {
+            if split == "train":
+                # ignore user warnings from pydantic in color jitter initialization
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    self.color_transforms = {
+                        "rgb-red": A.Compose(
+                            [
+                                A.ColorJitter(
+                                    brightness=0.4,
+                                    contrast=0.4,
+                                    saturation=0.4,
+                                    hue=0.1,
+                                    p=0.8,
+                                ),
+                                A.ToGray(p=0.1),
+                            ]
+                        ),
+                        "rgb-white": A.Compose(
+                            [
+                                A.ColorJitter(
+                                    brightness=0.4,
+                                    contrast=0.4,
+                                    saturation=0.4,
+                                    hue=0.1,
+                                    p=0.8,
+                                ),
+                                A.ToGray(p=0.1),
+                            ]
+                        ),
+                        "hsi": A.Compose(
+                            [
+                                A.RandomBrightnessContrast(p=0.5),
+                                A.OneOf(
+                                    [
+                                        A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+                                        A.GaussianBlur(
+                                            blur_limit=3, p=0.5, sigma_limit=(0.5, 3.0)
+                                        ),
+                                    ],
+                                    p=0.5,
+                                ),
+                            ]
+                        ),
+                    }
+            else:
+                self.color_transforms = {
+                    "rgb-red": lambda image: {"image": image},
+                    "rgb-white": lambda image: {"image": image},
+                    "hsi": lambda image: {"image": image},
+                }
+            self.norm = {
                 "rgb-red": A.Compose(
                     [
-                        A.ColorJitter(
-                            brightness=0.3,
-                            contrast=0.3,
-                            saturation=0.3,
-                            hue=0.1,
-                            p=0.75,
-                        ),
                         A.Normalize(
                             mean=channel_stats["rgb-red"]["mean"],
                             std=channel_stats["rgb-red"]["std"],
@@ -106,13 +155,6 @@ class GroupTransform:
                 ),
                 "rgb-white": A.Compose(
                     [
-                        A.ColorJitter(
-                            brightness=0.3,
-                            contrast=0.3,
-                            saturation=0.3,
-                            hue=0.1,
-                            p=0.75,
-                        ),
                         A.Normalize(
                             mean=channel_stats["rgb-white"]["mean"],
                             std=channel_stats["rgb-white"]["std"],
@@ -120,18 +162,8 @@ class GroupTransform:
                         ToTensorV2(),
                     ]
                 ),
-                # "hsi": A.Compose(
-                #     [
-                #         _HSINormalize(
-                #             mean=channel_stats["hsi"]["mean"],
-                #             std=channel_stats["hsi"]["std"],
-                #         ),
-                #         ToTensorV2(),
-                #     ]
-                # ),
                 "hsi": _HSINormalize(
-                    mean=channel_stats["hsi"]["mean"],
-                    std=channel_stats["hsi"]["std"],
+                    mean=channel_stats["hsi"]["mean"], std=channel_stats["hsi"]["std"]
                 ),
             }
         else:  # no augmentation except for resize and to tensor
@@ -156,6 +188,11 @@ class GroupTransform:
                 ),
             }
             self.color_transforms = {
+                "rgb-red": lambda image: {"image": image},
+                "rgb-white": lambda image: {"image": image},
+                "hsi": lambda image: {"image": image},
+            }
+            self.norm = {
                 "rgb-red": A.Compose(
                     [
                         A.Normalize(
@@ -212,11 +249,14 @@ class GroupTransform:
             augmented = self.geom_transforms[modality](
                 image=img, target_mask=target_mask
             )
+            image_transformed = self.color_transforms[modality](
+                image=augmented["image"]
+            )["image"]
 
             # Apply color transformation to the image only
             if modality == "hsi":
-                image_transformed = self.color_transforms[modality](
-                    image=augmented["image"],
+                image_transformed = self.norm[modality](
+                    image=image_transformed,
                     hsi_channel_dropout=data_m["hsi_channel_dropout"],
                 )["image"]
                 image_full = torch.zeros(
@@ -231,9 +271,9 @@ class GroupTransform:
                     ),
                 }
             else:
-                image_transformed = self.color_transforms[modality](
-                    image=augmented["image"]
-                )["image"]
+                image_transformed = self.norm[modality](image=image_transformed)[
+                    "image"
+                ]
                 data_aug[modality] = {
                     "image": image_transformed,
                     "target_mask": torch.from_numpy(augmented["target_mask"]).float(),
@@ -255,6 +295,8 @@ class ImageDataset(Dataset):
         # size of image patch after augmentation, i.e, network input
         crop_size_final: int | dict[str, int],
         hsi_wavelengths: np.ndarray,
+        split: str = "train",
+        _hsi_group_k: int = 0,
         _calc_stats_mode: bool = False,
     ):
         """
@@ -276,10 +318,12 @@ class ImageDataset(Dataset):
             crop_size_final = {k: crop_size_final for k in self.image_groups}
         self.crop_size_final = crop_size_final
         self.hsi_wavelengths = hsi_wavelengths
+        self._hsi_group_k = _hsi_group_k
 
         self.transform = GroupTransform(
             channel_stats=channel_stats,
             crop_size=crop_size_final,
+            split=split,
             _calc_stats_mode=_calc_stats_mode,
         )
 
@@ -324,8 +368,6 @@ class ImageDataset(Dataset):
         """
         row = self.df.iloc[idx]
         # coords = row[["coord_x", "coord_y"]].to_numpy()
-        coords_rgb = row[["coord_x_rgb", "coord_y_rgb"]].to_numpy()
-        coords_hsi = row[["coord_x_hsi", "coord_y_hsi"]].to_numpy()
         data = {}
 
         for ig in row["rand_chosen_igs"]:
@@ -335,25 +377,16 @@ class ImageDataset(Dataset):
             if ig == "hsi":
                 # 0 means a channel is dropped out, 1 means kept.
                 hsi_channel_dropout = row["rand_channel_dropout_hsi"]
+                coords_hsi = row[["coord_x_hsi", "coord_y_hsi"]].to_numpy()
                 # For efficiency in cropping and augmentation, we stack all the images
                 # that are not dropped in HSI group.
                 img = crop_image(
-                    np.dstack(
-                        [
-                            np.array(
-                                Image.open(
-                                    os.path.join(
-                                        row["rand_image_hsi_path"], f"{wl}.png"
-                                    )
-                                )
-                            )
-                            for wl in self.hsi_wavelengths[hsi_channel_dropout]
-                        ]
-                    ),
+                    self._read_hsi(row[f"rand_image_{ig}_path"], hsi_channel_dropout),
                     center=coords_hsi,
                     crop_size=crop_size_init,
                 )
             else:
+                coords_rgb = row[["coord_x_rgb", "coord_y_rgb"]].to_numpy()
                 img = crop_image(
                     np.array(Image.open(row[f"rand_image_{ig}_path"]).convert("RGB")),
                     center=coords_rgb,
@@ -405,8 +438,60 @@ class ImageDataset(Dataset):
                 else:
                     data_aug[ig]["dropped"] = False
                     data_aug[ig]["available"] = False
+        return {"data": data_aug, "label": row["label_clean_idx"]}
 
-        return {"data": data_aug, "label": row["label"]}
+    def _read_hsi(self, hsi_path, hsi_channel_dropout, t: int = 4) -> np.ndarray:
+        raise
+        read_img_func = lambda x: cv.imread(
+            os.path.join(hsi_path, x), cv.IMREAD_UNCHANGED
+        )
+        if self._hsi_group_k > 0:
+            # hsi is stored as channel-grouped 16bit tif, for example 3 channels per
+            # group, so that they can still be visually inspected. However in this case
+            # we should be more cautious about the dropout.
+            image_paths = []
+            wavelengths_read = []
+            for i in range(0, len(self.hsi_wavelengths), self._hsi_group_k):
+                if any(hsi_channel_dropout[i : i + self._hsi_group_k]):
+                    ws = self.hsi_wavelengths[i : i + self._hsi_group_k]
+                    image_paths.append("_".join(map(str, ws)) + ".tif")
+                    wavelengths_read.extend(
+                        list(
+                            range(
+                                i, min(i + self._hsi_group_k, len(self.hsi_wavelengths))
+                            )
+                        )
+                    )
+            if t > 1:  # use joblib
+                img = np.concatenate(
+                    Parallel(n_jobs=t, prefer="threads")(
+                        delayed(read_img_func)(os.path.join(hsi_path, path))
+                        for path in image_paths
+                    ),
+                    axis=-1,
+                )
+            else:
+                img = np.concatenate(
+                    [read_img_func(path) for path in image_paths], axis=-1
+                )
+            # drop those that are not needed
+            img = img[..., np.where(hsi_channel_dropout[wavelengths_read])[0]]
+        else:  # hsi is stored as channel-wise gray scale 16bit png.
+            if t > 1:  # use joblib
+                img = np.dstack(
+                    Parallel(n_jobs=t, prefer="threads")(
+                        delayed(read_img_func)(f"{wl}.png")
+                        for wl in self.hsi_wavelengths
+                    )
+                )
+            else:
+                img = np.dstack(
+                    [
+                        read_img_func(f"{wl}.png")
+                        for wl in self.hsi_wavelengths[hsi_channel_dropout]
+                    ]
+                )
+        return img
 
     @staticmethod
     def _crop_image(
@@ -525,11 +610,17 @@ def test_gaussian_image(plot: bool = True) -> None:
         fig.colorbar(img, ax=ax, location="right", anchor=(0, 0.5), shrink=0.3)
 
 
-class TampicDataModule(pl.LightningDataModule):
+class TAMPICDataModule(L.LightningDataModule):
     # selecting only 1 image group is the most likely.
     default_p_num_igs = {1: 2, 2: 1, 3: 1}
     # selecting rgb-white is the most likely, followed by rgb-red, and hsi.
     default_p_igs = {"rgb-red": 2, "rgb-white": 3, "hsi": 1}
+
+    # for validation set, let's default to selecting as many as possible
+    default_p_num_igs_val = {k: 0 for k in default_p_num_igs.keys()}
+    default_p_num_igs_val[max(default_p_num_igs.keys())] = 1
+    # doesn't matter, everyone will be selected anyways
+    default_p_igs_val = {k: 1 for k in default_p_igs.keys()}
 
     def __init__(
         self,
@@ -543,16 +634,24 @@ class TampicDataModule(pl.LightningDataModule):
         weight_by_density: bool = False,
         weight_density_kernel_size: int = 5,
         weight_by_plate: bool = False,
+        #
         p_num_igs: Optional[list[int]] = None,
         p_igs: Optional[list[int]] = None,
         p_last_time_point: Optional[list[int]] = 0.5,
-        p_hsi_channels=0.3,
+        p_hsi_channels: float = 0.3,
         rng_seed: Optional[int] = 42,
+        #
+        p_num_igs_val: Optional[list[int]] = None,
+        p_igs_val: Optional[list[int]] = None,
+        p_last_time_point_val: Optional[list[int]] = 0.5,
+        p_hsi_channels_val: float = 1.0,
+        rng_seed_val: Optional[int] = 60,  # let's separate the seeds
         #
         amplicon_type: str = None,
         taxon_level: str = "genus",
         min_counts: int = 10,
         min_counts_dominate: int = 0,
+        min_purity: float = 0.1,
         min_ratio: int = 2,
         min_num_isolates: int = 30,
         keep_empty: bool = False,
@@ -567,6 +666,7 @@ class TampicDataModule(pl.LightningDataModule):
         num_workers: int,
         num_batches_per_epoch: Optional[int] = None,
         #
+        _hsi_group_k: int = 0,
         _calc_stats_mode: bool = False,
     ):
         """
@@ -608,12 +708,21 @@ class TampicDataModule(pl.LightningDataModule):
         self.p_last_time_point = p_last_time_point
         self.p_hsi_channels = p_hsi_channels
         self._rng = np.random.default_rng(rng_seed)
+        # the above for validation
+        self.p_num_igs_val = (
+            p_num_igs_val if p_num_igs_val else self.default_p_num_igs_val
+        )
+        self.p_igs_val = p_igs_val if p_igs_val else self.default_p_igs_val
+        self.p_last_time_point_val = p_last_time_point_val
+        self.p_hsi_channels_val = p_hsi_channels_val
+        self._rng_val = np.random.default_rng(rng_seed_val)
 
         # arguments for getting labels
         self.amplicon_type = amplicon_type
         self.taxon_level = taxon_level
         self.min_counts = min_counts
         self.min_counts_dominate = min_counts_dominate
+        self.min_purity = min_purity
         self.min_ratio = min_ratio
         self.min_num_isolates = min_num_isolates
         self.keep_empty = keep_empty  # `empty` will be one of the target labels
@@ -631,6 +740,7 @@ class TampicDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
 
         # others
+        self._hsi_group_k = _hsi_group_k
         self._calc_stats_mode = _calc_stats_mode
 
     def setup(self, stage: Optional[str] = None):
@@ -642,10 +752,11 @@ class TampicDataModule(pl.LightningDataModule):
         """
         if stage in (None, "fit"):
             df_all = self._json_to_dataframe(self.metadata_train_path)
-            df_train = df_all.query("split == 'train'").copy()
-            self._fit_labels(df_train)
-            df_train = self._transform_labels(df_train)
-            self.df_train_all = self._add_weight(df_train)
+            df_train_all = df_all.query("split == 'train'").copy()
+            self._fit_labels(df_train_all)
+            df_train_all = self._transform_labels(df_train_all)
+            self._calc_training_stats(df_train_all)
+            self.df_train_all = self._add_weight(df_train_all)
 
             df_val_easy = df_all.query("split == 'val_easy'").copy()
             df_val_mid = df_all.query("split == 'val_mid'").copy()
@@ -670,6 +781,8 @@ class TampicDataModule(pl.LightningDataModule):
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
             hsi_wavelengths=self.hsi_wavelengths,
+            split="train",
+            _hsi_group_k=self._hsi_group_k,
             _calc_stats_mode=self._calc_stats_mode,
         )
 
@@ -687,22 +800,28 @@ class TampicDataModule(pl.LightningDataModule):
         Returns:
             list[DataLoader]: list of validation dataloaders.
         """
+        df_val_easy = self._set_randomness(self.df_val_easy, split="val")
         val_dataset_1 = ImageDataset(
-            df=self.df_val_easy,
+            df=df_val_easy,
             channel_stats=self.stats,
             target_mask_kernel_size=self.target_mask_kernel_size,
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
-            num_hsi_channels=self.num_hsi_channels,
+            hsi_wavelengths=self.hsi_wavelengths,
+            split="val",
+            _hsi_group_k=self._hsi_group_k,
         )
 
+        df_val_mid = self._set_randomness(self.df_val_mid, split="val")
         val_dataset_2 = ImageDataset(
-            df=self.df_val_mid,
+            df=df_val_mid,
             channel_stats=self.stats,
             target_mask_kernel_size=self.target_mask_kernel_size,
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
-            num_hsi_channels=self.num_hsi_channels,
+            hsi_wavelengths=self.hsi_wavelengths,
+            split="val",
+            _hsi_group_k=self._hsi_group_k,
         )
 
         return [
@@ -802,10 +921,11 @@ class TampicDataModule(pl.LightningDataModule):
                         continue
                     label = get_isolate_label(
                         meta_isolate[self.amplicon_type],
-                        self.min_counts,
-                        self.min_counts_dominate,
-                        self.min_ratio,
-                        self.taxon_level_idx,
+                        min_counts=self.min_counts,
+                        min_counts_dominate=self.min_counts_dominate,
+                        min_ratio=self.min_ratio,
+                        min_purity=self.min_purity,
+                        taxon_level_idx=self.taxon_level_idx,
                     )
                     rows.append(
                         {
@@ -888,20 +1008,26 @@ class TampicDataModule(pl.LightningDataModule):
 
         label_counts = df["label"].value_counts().to_dict()
         iter_label_counts = iter(label_counts.items())
-        for i, (label, count) in enumerate(iter_label_counts):
+        i = 0
+        for label, count in iter_label_counts:
+            if label in ["impure", "ambiguous"]:
+                continue
             if count >= self.min_num_isolates:
                 if self.keep_empty or label != "empty":
                     label2idx[label] = i
                     label_clean2idx[label] = i
                     idx2label_clean[i] = label
+                    i += 1
             else:
                 break
         if self.keep_others:  # keep iterating
-            i += 1
             label_clean2idx["others"] = i
             idx2label_clean[i] = "others"
-            for i, (label, count) in enumerate(iter_label_counts, start=i + 1):
+            for label, count in iter_label_counts:
+                if label in ["impure", "ambiguous"]:
+                    continue
                 label2idx[label] = i
+                i += 1
 
         self.label2idx = label2idx
         self.label_clean2idx = label_clean2idx
@@ -909,14 +1035,16 @@ class TampicDataModule(pl.LightningDataModule):
 
     def _transform_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """Transform the labels in the DataFrame to numerical values."""
-        df["label_clean_idx"] = df["label"].apply(
-            lambda x: self.label_clean2idx.get(x, self.label_clean2idx["others"])
-        )
-        df = df.query("label_clean_idx != 'impure' and label_clean_idx != 'ambiguous'")
-        if not self.keep_others:
-            df = df.query("label_clean_idx != 'others'")
-        if not self.keep_empty:
-            df = df.query("label_clean_idx != 'empty'")
+        # first map all legit taxon name and "others" and "empty" (conditioned on hparams) to idx
+        # all other labels are dropped.
+        df["label_idx"] = df["label"].map(self.label2idx.get)
+        df = df.dropna(subset=["label_idx"]).copy()
+        df["label_idx"] = df["label_idx"].astype(int)
+        # then we map labels to clean labels, and drop those that are not in clean labels,
+        # for example, when not keeping others, all minor labels are dropped here.
+        df["label_clean"] = df["label_idx"].map(self.idx2label_clean)
+        df = df.dropna(subset=["label_clean"]).copy()
+        df["label_clean_idx"] = df["label_clean"].map(self.label_clean2idx).astype(int)
         return df
 
     def _add_weight(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -957,6 +1085,23 @@ class TampicDataModule(pl.LightningDataModule):
         df["weight"] = weights
         return df
 
+    def _calc_training_stats(self, df: pd.DataFrame) -> None:
+        num_batches_per_epoch_max = len(df) // (self.batch_size * self.num_devices)
+        if self.num_batches_per_epoch <= 0:
+            # set num batches per epoch as big as possible
+            self._num_batches_per_epoch = num_batches_per_epoch_max
+        else:
+            self._num_batches_per_epoch = self.num_batches_per_epoch
+        self.num_samples_per_epoch = (
+            self._num_batches_per_epoch * self.batch_size * self.num_devices
+        )
+        if self.num_samples_per_epoch > len(df):
+            rprint(
+                f"Epoch length ({self.num_samples_per_epoch}) exceeds the length of the DataFrame "
+                f"({len(df)}). Reset to the maximum possible value ({num_batches_per_epoch_max})."
+            )
+            self._num_batches_per_epoch = num_batches_per_epoch_max
+
     def _sample_training_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Sample training data based on epoch length, batch size, and number of devices.
@@ -967,23 +1112,8 @@ class TampicDataModule(pl.LightningDataModule):
         Returns:
             pd.DataFrame: Sampled DataFrame.
         """
-        num_batches_per_epoch_max = len(df) // (self.batch_size * self.num_devices)
-        if self.num_batches_per_epoch <= 0:
-            # set num batches per epoch as big as possible
-            self._num_batches_per_epoch = num_batches_per_epoch_max
-        else:
-            self._num_batches_per_epoch = self.num_batches_per_epoch
-        self.epoch_length = (
-            self._num_batches_per_epoch * self.batch_size * self.num_devices
-        )
-        if self.epoch_length > len(df):
-            rprint(
-                f"Epoch length ({self.epoch_length}) exceeds the length of the DataFrame "
-                f"({len(df)}). Reset to the maximum possible value ({num_batches_per_epoch_max})."
-            )
-            self._num_batches_per_epoch = num_batches_per_epoch_max
         sampled_df = df.sample(
-            n=self.epoch_length,
+            n=self.num_samples_per_epoch,
             replace=False,
             weights=df["weight"],
             random_state=self._rng,
@@ -999,7 +1129,7 @@ class TampicDataModule(pl.LightningDataModule):
         )
         return sampled_df
 
-    def _set_randomness(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _set_randomness(self, df: pd.DataFrame, split: str = "train") -> pd.DataFrame:
         """
         Add random components to the DataFrame for training.
 
@@ -1009,6 +1139,14 @@ class TampicDataModule(pl.LightningDataModule):
         Returns:
             pd.DataFrame: DataFrame with added random components.
         """
+        if split == "train":
+            _rng = self._rng
+            p_num_igs = self.p_num_igs
+            p_igs = self.p_igs
+        else:
+            _rng = self._rng_val
+            p_num_igs = self.p_num_igs_val
+            p_igs = self.p_igs_val
         idx = df.index
         df = df.copy().reset_index(drop=True)
         # for idx_start in range(0, len(df), self.batch_size):
@@ -1017,11 +1155,11 @@ class TampicDataModule(pl.LightningDataModule):
             img_groups_avail = sample_info["image_groups_available"]
             # -1 since we are using pandas loc
             # idx_end = idx_start + self.batch_size - 1
-            p1 = np.array(list(self.p_num_igs.values()))
-            num_igs = self._rng.choice(list(self.p_num_igs.keys()), p=p1 / p1.sum())
+            p1 = np.array(list(p_num_igs.values()))
+            num_igs = _rng.choice(list(p_num_igs.keys()), p=p1 / p1.sum())
             num_igs = min(num_igs, len(img_groups_avail))
-            p2 = np.array([self.p_igs[ig] for ig in img_groups_avail])
-            igs = self._rng.choice(
+            p2 = np.array([p_igs[ig] for ig in img_groups_avail])
+            igs = _rng.choice(
                 list(img_groups_avail), size=num_igs, replace=False, p=p2 / p2.sum()
             )
             df.loc[idx_start, "rand_num_igs"] = num_igs
@@ -1032,17 +1170,16 @@ class TampicDataModule(pl.LightningDataModule):
                 [igs], index=[idx_start]
             )
             for ig in igs:
-                tps_all = sorted(df.loc[idx_start, "image_groups_info"][ig].keys())
+                tps = sorted(df.loc[idx_start, "image_groups_info"][ig].keys())
                 # for j, tp in enumerate(tps_all, idx_start):
                 j = idx_start
-                tp = tps_all
-                if len(tp) == 1:
-                    rand_tp = tp[0]
+                if len(tps) == 1:
+                    rand_tp = tps[0]
                 else:
-                    p_tps = [(1 - self.p_last_time_point) / (len(tp) - 1)] * (
-                        len(tp) - 1
+                    p_tps = [(1 - self.p_last_time_point) / (len(tps) - 1)] * (
+                        len(tps) - 1
                     ) + [self.p_last_time_point]
-                    rand_tp = self._rng.choice(tp, p=p_tps)
+                    rand_tp = _rng.choice(tps, p=p_tps)
                 df.loc[j, f"rand_image_{ig}_tp"] = rand_tp
                 if ig == "hsi":
                     # hsi is different since:
@@ -1066,7 +1203,7 @@ class TampicDataModule(pl.LightningDataModule):
                     # 1 are kept, 0 are dropped.
                     channel_dropout_mask = np.zeros(self.num_hsi_channels, dtype=bool)
                     channel_dropout_mask[
-                        self._rng.choice(
+                        _rng.choice(
                             self.num_hsi_channels,
                             size=int(self.num_hsi_channels * self.p_hsi_channels),
                             replace=False,
@@ -1097,6 +1234,7 @@ def get_isolate_label(
     min_counts: int = 10,
     min_counts_dominate: int = 0,
     min_ratio: int = 2,
+    min_purity: float = 0.0,
     taxon_level_idx: int = -1,
 ) -> str:
     """Get the label of an isolate given its amplicon sequencing.
@@ -1124,7 +1262,10 @@ def get_isolate_label(
         else:
             ret = "ambiguous"
     elif zotus[0] != "#UNKNOWN" and counts[0] >= min_counts_dominate:
-        # remove "#UNKNOWN" if it is one of the zotus
+        purity = counts[0] / sum(counts)
+        if purity < min_purity:
+            return ret
+        # remove "#UNKNOWN" if it is one of the zotus and filter for ratio
         unknown_idx = np.where(zotus == "#UNKNOWN")[0]
         if unknown_idx.shape[0]:
             counts = np.delete(counts, unknown_idx)
@@ -1146,18 +1287,14 @@ def recursive_inspect(item):
         try:
             shape = item.shape
         except AttributeError:
-            shape = 'N/A'
+            shape = "N/A"
 
         try:
             dtype = item.dtype
         except AttributeError:
-            dtype = 'N/A'
+            dtype = "N/A"
 
-        return {
-            'type': str(type(item)),
-            'dtype': str(dtype),
-            'shape': shape
-        }
+        return {"type": str(type(item)), "dtype": str(dtype), "shape": shape}
 
 
 if __name__ == "__main__":
@@ -1179,9 +1316,10 @@ if __name__ == "__main__":
     if args.command == "test":
         base_dir = "/mnt/c/aws_data/data/camii"
         base_dir = "/home/ubuntu/data/camii"
-        for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
+        # for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
+        for amplicon_type, taxon_level in zip(["its"], ["species"]):
             t0 = time.perf_counter()
-            dm = TampicDataModule(
+            dm = TAMPICDataModule(
                 metadata_train_path=f"{base_dir}/all_0531.json",
                 weight_by_label=True,
                 weight_by_density=False,
@@ -1190,7 +1328,7 @@ if __name__ == "__main__":
                 # p_num_igs=None,
                 # p_igs=None,
                 p_last_time_point=0.6,
-                p_hsi_channels=0.3,
+                p_hsi_channels=0.9,
                 rng_seed=42,
                 amplicon_type=amplicon_type,
                 taxon_level=taxon_level,
@@ -1205,24 +1343,26 @@ if __name__ == "__main__":
                 target_mask_kernel_size=5,
                 num_devices=2,
                 batch_size=8,
-                num_workers=1,
+                num_workers=10,
                 num_batches_per_epoch=50,
+                _hsi_group_k=3,
             )
             dm.setup()
-            dl_train = dm.train_dataloader()
+            dl_train = dm.val_dataloader()[0]
             t1 = time.perf_counter()
             rprint(f"Time to setup data module: {t1 - t0:.2f} s")
             first_sample = next(iter(dl_train))
             t2 = time.perf_counter()
-            rprint(f"Time to load first sample: {t2 - t1:.2f} s")
             shape = recursive_inspect(first_sample)
-            print(json.dumps(shape, indent=4))
+            rprint(json.dumps(shape, indent=4))
+            rprint(f"Time to load first sample: {t2 - t1:.2f} s")
             ts = [t2]
             for i, batch in enumerate(tqdm(dl_train)):
                 ts.append(time.perf_counter())
             rprint(
                 f"Time to load one batch: {np.mean(np.diff(ts)):.2f} s, with batch "
-                f"size = {dm.batch_size}, num_workers = {dm.num_workers}, p_hsichannels = {dm.p_hsi_channels}"
+                f"size = {dm.batch_size}, num_workers = {dm.num_workers}, "
+                f"p_hsichannels = {dm.p_hsi_channels}"
             )
     elif args.command == "calc_stats":
         # in this subcommand, we calculate the mean and std of each channel.
@@ -1235,7 +1375,7 @@ if __name__ == "__main__":
         for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
             if amplicon_type == "16s":
                 continue
-            dm = TampicDataModule(
+            dm = TAMPICDataModule(
                 metadata_train_path=f"{base_dir}/all_0531.json",
                 weight_by_label=False,
                 weight_by_density=False,
@@ -1261,6 +1401,7 @@ if __name__ == "__main__":
                 batch_size=4,
                 num_workers=12,
                 num_batches_per_epoch=-1,
+                _hsi_group_k=3,
                 _calc_stats_mode=True,
             )
             dm.setup()
@@ -1319,7 +1460,3 @@ if __name__ == "__main__":
 
             hsi_mean = hsi_sum / n_hsi
             hsi_std = torch.sqrt((hsi_sum_sq / n_hsi) - (hsi_mean**2))
-
-            import pdb
-
-            pdb.set_trace()

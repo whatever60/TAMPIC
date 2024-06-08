@@ -57,12 +57,12 @@ class AdaptiveConvBlock(nn.Module):
         return output
 
 
-class CustomResNet(ResNet):
+class TAMPICResNet(ResNet):
     image_groups = ["rgb-red", "rgb-white", "hsi"]
     def __init__(
         self, block, layers, num_classes=1000, state_dict=None,
     ):
-        super(CustomResNet, self).__init__(block, layers, num_classes)
+        super(TAMPICResNet, self).__init__(block, layers, num_classes)
 
         self.conv1_rgb_red = nn.Conv2d(
             3, 64, kernel_size=7, stride=2, padding=3, bias=False
@@ -145,14 +145,14 @@ class CustomResNet(ResNet):
         return x
 
 
-def resnet18_custom(num_classes=1000, pretrained=False, _reuse_head: bool = False):
+def resnet18_tampic(num_classes=1000, pretrained=False, _reuse_head: bool = False):
     # if pretrained:
     #     state_dict = torch.hub.load_state_dict_from_url(
     #         "https://download.pytorch.org/models/resnet18-5c106cde.pth", progress=True
     #     )
     # else:
     #     state_dict = None
-    # model = CustomResNet(
+    # model = TAMPICResNet(
     #     BasicBlock, [2, 2, 2, 2], num_classes=num_classes, weights=ResNet18_Weights.IMAGENET1K_V1
     # )
     if pretrained:
@@ -163,13 +163,13 @@ def resnet18_custom(num_classes=1000, pretrained=False, _reuse_head: bool = Fals
             del state_dict["fc.bias"]
     else:
         state_dict = None
-    model = CustomResNet(
+    model = TAMPICResNet(
         BasicBlock, [2, 2, 2, 2], num_classes=num_classes, state_dict=state_dict
     )
     return model
 
 
-def resnet34_custom(num_classes=1000, pretrained=False):
+def resnet34_tampic(num_classes=1000, pretrained=False):
     if pretrained:
         _model = torch.hub.load("pytorch/vision", "resnet34", weights="IMAGENET1K_V1")
         state_dict = _model.state_dict()
@@ -177,13 +177,13 @@ def resnet34_custom(num_classes=1000, pretrained=False):
         del state_dict["fc.bias"]
     else:
         state_dict = None
-    model = CustomResNet(
+    model = TAMPICResNet(
         BasicBlock, [3, 4, 6, 3], num_classes=num_classes, state_dict=state_dict
     )
 
     return model
 
-def resnet50_custom(num_classes=1000, pretrained=False):
+def resnet50_tampic(num_classes=1000, pretrained=False):
     if pretrained:
         _model = torch.hub.load("pytorch/vision", "resnet50", weights="IMAGENET1K_V2")
         state_dict = _model.state_dict()
@@ -191,7 +191,7 @@ def resnet50_custom(num_classes=1000, pretrained=False):
         del state_dict["fc.bias"]
     else:
         state_dict = None
-    model = CustomResNet(
+    model = TAMPICResNet(
         BasicBlock, [3, 4, 6, 3], num_classes=num_classes, state_dict=state_dict
     )
 
@@ -253,19 +253,19 @@ if __name__ == "__main__":
     wavelengths = torch.linspace(-1, 1, num_channels)
 
     # from scratch
-    model = resnet18_custom(num_classes=30, pretrained=False)
+    model = resnet18_tampic(num_classes=30, pretrained=False)
     output = model(data["data"], wavelengths)
     _ = model.get_param_groups()
     print(output.size())
 
     # pretrained
-    model = resnet18_custom(num_classes=30, pretrained=True)
+    model = resnet18_tampic(num_classes=30, pretrained=True)
     output = model(data["data"], wavelengths)
     _ = model.get_param_groups()
     print(output.size())
 
     # test with an image
-    model = resnet18_custom(num_classes=1000, pretrained=True, _reuse_head=True)
+    model = resnet18_tampic(num_classes=1000, pretrained=True, _reuse_head=True)
     model.eval()
     weights = ResNet18_Weights.DEFAULT
     transform = weights.transforms()

@@ -77,6 +77,8 @@ if __name__ == "__main__":
     total_iters = 2000
     warmup_iters = 100
 
+    fig, ax = plt.subplots()
+
     # Test WarmupScheduler with cosine annealing
     optimizer = torch.optim.Adam([parameters], lr=0.2)
     scheduler = WarmupScheduler(
@@ -91,7 +93,7 @@ if __name__ == "__main__":
     for _iter in range(total_iters):
         scheduler.step()
         actual_lr.append(optimizer.param_groups[0]["lr"])
-    plt.plot(list(range(total_iters)), actual_lr, label="CosineAnnealingLRWarmup")
+    ax.plot(list(range(total_iters)), actual_lr, label="CosineAnnealingLRWarmup")
 
     # Test WarmupScheduler with linear warmup
     optimizer = torch.optim.Adam([parameters], lr=0.2)
@@ -107,9 +109,27 @@ if __name__ == "__main__":
     for _iter in range(total_iters):
         scheduler.step()
         actual_lr.append(optimizer.param_groups[0]["lr"])
-    plt.plot(list(range(total_iters)), actual_lr, "--", label="LinearWarmup")
+    ax.plot(list(range(total_iters)), actual_lr, "--", label="LinearWarmup")
 
-    plt.xlabel("iterations")
-    plt.ylabel("learning rate")
-    plt.legend()
-    plt.savefig("scheduler.png")
+    ax_t = ax.twinx()
+    # plot mulitplier for cos
+    optimizer = torch.optim.Adam([parameters], lr=0.2)
+    scheduler = WarmupScheduler(
+        optimizer,
+        T_max=total_iters,
+        T_warmup=warmup_iters,
+        start_lr=0.02,
+        end_lr=0.1,
+        mode="cosine",
+    )
+    multipliers = []
+    for _iter in range(total_iters):
+        multiplier = scheduler._decay_func(_iter)
+        multipliers.append(multiplier)
+    ax_t.plot(list(range(total_iters)), multipliers, color="g", label="CosineAnnealingLRWarmup multiplier")
+    ax.set_xlabel("iterations")
+    ax.set_ylabel("learning rate")
+    ax_t.set_ylabel("multiplier")
+    ax.legend()
+    ax_t.legend()
+    fig.savefig("scheduler.png")
