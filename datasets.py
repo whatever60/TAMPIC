@@ -23,12 +23,18 @@ from crop_image import crop_image
 
 
 class _HSINormalize(A.Normalize):
-    def __init__(self, mean: list[float], std: list[float]):
+    def __init__(self, mean: list[float], std: list[float], ceil:int=None):
+        if ceil is not None:
+            mean = mean / ceil
         super().__init__(mean, std)
         self._to_tensor = T.ToTensor()
 
     def __call__(self, **kwargs):
         img = kwargs["image"]
+        if not isinstance(img, np.ndarray) and img.dtype == np.uint16:
+            raise ValueError(f"Image must be a numpy array of type uint16, getting {type(img)}")
+        img = img / 2 ** 16
+        
         dropout = kwargs["hsi_channel_dropout"]
         mean = np.array(self.mean)
         std = np.array(self.std)
@@ -41,12 +47,18 @@ class GroupTransform:
         self,
         channel_stats: dict[str, dict[str, float]],
         crop_size: int | dict[str, int],
+        hsi_ceil: int=None,
         split: str = "train",
         _calc_stats_mode: bool = False,
+        _no_norm: bool = False,
     ):
         if isinstance(crop_size, int):
             crop_size = {"rgb-red": crop_size, "rgb-white": crop_size, "hsi": crop_size}
         self.crop_size = crop_size
+
+        def _norm_for_no_norm(**kwargs):
+            kwargs["image"] = kwargs["image"].transpose(2, 0, 1)
+            return kwargs
 
         if not _calc_stats_mode:
             # Geometric transformations applied per modality
@@ -139,9 +151,9 @@ class GroupTransform:
                     }
             else:
                 self.color_transforms = {
-                    "rgb-red": lambda image: {"image": image},
-                    "rgb-white": lambda image: {"image": image},
-                    "hsi": lambda image: {"image": image},
+                    "rgb-red": lambda **kwargs: kwargs,
+                    "rgb-white": lambda **kwargs: kwargs,
+                    "hsi": lambda **kwargs: kwargs,
                 }
             self.norm = {
                 "rgb-red": A.Compose(
@@ -163,34 +175,21 @@ class GroupTransform:
                     ]
                 ),
                 "hsi": _HSINormalize(
-                    mean=channel_stats["hsi"]["mean"], std=channel_stats["hsi"]["std"]
+                    mean=channel_stats["hsi"]["mean"],
+                    std=channel_stats["hsi"]["std"],
                 ),
             }
-        else:  # no augmentation except for resize and to tensor
+
+        else:  # no augmentation
             self.geom_transforms = {
-                "rgb-red": A.Compose(
-                    [
-                        A.HorizontalFlip(p=0),
-                    ],
-                    additional_targets={"target_mask": "image"},
-                ),
-                "rgb-white": A.Compose(
-                    [
-                        A.HorizontalFlip(p=0),
-                    ],
-                    additional_targets={"target_mask": "image"},
-                ),
-                "hsi": A.Compose(
-                    [
-                        A.HorizontalFlip(p=0),
-                    ],
-                    additional_targets={"target_mask": "image"},
-                ),
+                "rgb-red": lambda **kwargs: kwargs,
+                "rgb-white": lambda **kwargs: kwargs,
+                "hsi": lambda **kwargs: kwargs,
             }
             self.color_transforms = {
-                "rgb-red": lambda image: {"image": image},
-                "rgb-white": lambda image: {"image": image},
-                "hsi": lambda image: {"image": image},
+                "rgb-red": lambda **kwargs: kwargs,
+                "rgb-white": lambda **kwargs: kwargs,
+                "hsi": lambda **kwargs: kwargs,
             }
             self.norm = {
                 "rgb-red": A.Compose(
@@ -199,7 +198,9 @@ class GroupTransform:
                             mean=np.zeros_like(
                                 channel_stats["rgb-red"]["mean"]
                             ).tolist(),
-                            std=np.ones_like(channel_stats["rgb-red"]["std"]).tolist(),
+                            std=np.ones_like(
+                                channel_stats["rgb-red"]["std"]
+                            ).tolist(),
                         ),
                         ToTensorV2(),
                     ]
@@ -221,6 +222,12 @@ class GroupTransform:
                     mean=np.zeros_like(channel_stats["hsi"]["mean"]).tolist(),
                     std=np.ones_like(channel_stats["hsi"]["std"]).tolist(),
                 ),
+            }
+        if _no_norm:
+            self.norm = {
+                "rgb-red": _norm_for_no_norm,
+                "rgb-white": _norm_for_no_norm,
+                "hsi": _norm_for_no_norm,
             }
 
     def __call__(
@@ -295,6 +302,7 @@ class ImageDataset(Dataset):
         # size of image patch after augmentation, i.e, network input
         crop_size_final: int | dict[str, int],
         hsi_wavelengths: np.ndarray,
+        hsi_ceil: int=None,
         split: str = "train",
         _hsi_group_k: int = 0,
         _calc_stats_mode: bool = False,
@@ -318,13 +326,23 @@ class ImageDataset(Dataset):
             crop_size_final = {k: crop_size_final for k in self.image_groups}
         self.crop_size_final = crop_size_final
         self.hsi_wavelengths = hsi_wavelengths
+        self.hsi_ceil = hsi_ceil
         self._hsi_group_k = _hsi_group_k
 
         self.transform = GroupTransform(
             channel_stats=channel_stats,
             crop_size=crop_size_final,
+        hsi_ceil = hsi_ceil,
             split=split,
             _calc_stats_mode=_calc_stats_mode,
+        )
+        self._transform_for_visual = GroupTransform(
+            channel_stats=channel_stats,
+            crop_size=crop_size_final,
+        hsi_ceil = hsi_ceil,
+            split=split,
+            _calc_stats_mode=_calc_stats_mode,
+            _no_norm=True,
         )
 
     def __len__(self) -> int:
@@ -335,6 +353,12 @@ class ImageDataset(Dataset):
             int: Total number of images.
         """
         return len(self.df)
+
+    def getitem_no_norm(self, idx: int) -> dict[str, torch.Tensor]:
+        self._transform, self.transform = self.transform, self._transform_for_visual
+        data = self.__getitem__(idx)
+        self.transform, self._transform = self._transform, self.transform
+        return data
 
     def __getitem__(
         self, idx: int
@@ -441,7 +465,6 @@ class ImageDataset(Dataset):
         return {"data": data_aug, "label": row["label_clean_idx"]}
 
     def _read_hsi(self, hsi_path, hsi_channel_dropout, t: int = 4) -> np.ndarray:
-        raise
         read_img_func = lambda x: cv.imread(
             os.path.join(hsi_path, x), cv.IMREAD_UNCHANGED
         )
@@ -781,6 +804,7 @@ class TAMPICDataModule(L.LightningDataModule):
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
             hsi_wavelengths=self.hsi_wavelengths,
+            hsi_ceil=self.hsi_ceil,
             split="train",
             _hsi_group_k=self._hsi_group_k,
             _calc_stats_mode=self._calc_stats_mode,
@@ -808,6 +832,7 @@ class TAMPICDataModule(L.LightningDataModule):
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
             hsi_wavelengths=self.hsi_wavelengths,
+            hsi_ceil=self.hsi_ceil,
             split="val",
             _hsi_group_k=self._hsi_group_k,
         )
@@ -820,6 +845,7 @@ class TAMPICDataModule(L.LightningDataModule):
             crop_size_init=self.crop_size_init,
             crop_size_final=self.crop_size_final,
             hsi_wavelengths=self.hsi_wavelengths,
+            hsi_ceil=self.hsi_ceil,
             split="val",
             _hsi_group_k=self._hsi_group_k,
         )
@@ -863,6 +889,7 @@ class TAMPICDataModule(L.LightningDataModule):
         self.hsi_wavelengths = np.loadtxt(
             os.path.join(metadata_dir, global_properties["hsi_wavelengths"])
         )
+        self.hsi_ceil = global_properties["hsi_ceil"]
         self.taxon_levels = np.array(global_properties["taxonomy_levels"])
         self.taxon_level_idx = np.where(self.taxon_levels == self.taxon_level)[0][0]
         self.stats = global_properties["stats"]  # for normalization
@@ -1294,7 +1321,11 @@ def recursive_inspect(item):
         except AttributeError:
             dtype = "N/A"
 
-        return {"type": str(type(item)), "dtype": str(dtype), "shape": shape}
+        return {
+            "type": str(type(item)),
+            "dtype": str(dtype),
+            "shape": "[" + ", ".join(map(str, shape)) + "]",
+        }
 
 
 if __name__ == "__main__":
@@ -1343,7 +1374,7 @@ if __name__ == "__main__":
                 target_mask_kernel_size=5,
                 num_devices=2,
                 batch_size=8,
-                num_workers=10,
+                num_workers=0,
                 num_batches_per_epoch=50,
                 _hsi_group_k=3,
             )
@@ -1372,6 +1403,19 @@ if __name__ == "__main__":
         # as time point selection and crop size.
         base_dir = "/mnt/c/aws_data/data/camii"
         base_dir = "/home/ubuntu/data/camii"
+        num_channels_rgb_red = 3
+        num_channels_rgb_white = 3
+        num_channels_hsi = 462
+        # Initialize variables for mean and std calculations for each channel
+        rgb_red_sum = torch.zeros(num_channels_rgb_red)
+        rgb_red_sum_sq = torch.zeros(num_channels_rgb_red)
+        rgb_white_sum = torch.zeros(num_channels_rgb_white)
+        rgb_white_sum_sq = torch.zeros(num_channels_rgb_white)
+        hsi_sum = torch.zeros(num_channels_hsi)
+        hsi_sum_sq = torch.zeros(num_channels_hsi)
+        n_rgb_red = torch.zeros(num_channels_rgb_red)
+        n_rgb_white = torch.zeros(num_channels_rgb_white)
+        n_hsi = torch.zeros(num_channels_hsi)
         for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
             if amplicon_type == "16s":
                 continue
@@ -1379,7 +1423,7 @@ if __name__ == "__main__":
                 metadata_train_path=f"{base_dir}/all_0531.json",
                 weight_by_label=False,
                 weight_by_density=False,
-                weight_density_kernel_size=50,
+                weight_density_kernel_size=None,
                 weight_by_plate=False,
                 p_num_igs={1: 0, 2: 0, 3: 1},
                 # p_igs=None,
@@ -1395,7 +1439,7 @@ if __name__ == "__main__":
                 keep_empty=False,
                 keep_others=True,
                 crop_size_init={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
-                crop_size_final={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
+                crop_size_final=None,
                 target_mask_kernel_size=5,
                 num_devices=1,
                 batch_size=4,
@@ -1406,20 +1450,6 @@ if __name__ == "__main__":
             )
             dm.setup()
             dl_train = dm.train_dataloader()
-
-            num_channels_rgb_red = 3
-            num_channels_rgb_white = 3
-            num_channels_hsi = dm.num_hsi_channels
-            # Initialize variables for mean and std calculations for each channel
-            rgb_red_sum = torch.zeros(num_channels_rgb_red)
-            rgb_red_sum_sq = torch.zeros(num_channels_rgb_red)
-            rgb_white_sum = torch.zeros(num_channels_rgb_white)
-            rgb_white_sum_sq = torch.zeros(num_channels_rgb_white)
-            hsi_sum = torch.zeros(num_channels_hsi)
-            hsi_sum_sq = torch.zeros(num_channels_hsi)
-            n_rgb_red = torch.zeros(num_channels_rgb_red)
-            n_rgb_white = torch.zeros(num_channels_rgb_white)
-            n_hsi = torch.zeros(num_channels_hsi)
 
             # Iterate over the batches
             for batch in tqdm(dl_train):
@@ -1449,14 +1479,14 @@ if __name__ == "__main__":
                         hsi_sum_sq += (hsi_img**2).sum(dim=(1, 2))
                         n_hsi += hsi_img[0].numel()
 
-            # Calculate mean and standard deviation
-            rgb_red_mean = rgb_red_sum / n_rgb_red
-            rgb_red_std = torch.sqrt((rgb_red_sum_sq / n_rgb_red) - (rgb_red_mean**2))
+        # Calculate mean and standard deviation
+        rgb_red_mean = rgb_red_sum / n_rgb_red
+        rgb_red_std = torch.sqrt((rgb_red_sum_sq / n_rgb_red) - (rgb_red_mean**2))
 
-            rgb_white_mean = rgb_white_sum / n_rgb_white
-            rgb_white_std = torch.sqrt(
-                (rgb_white_sum_sq / n_rgb_white) - (rgb_white_mean**2)
-            )
+        rgb_white_mean = rgb_white_sum / n_rgb_white
+        rgb_white_std = torch.sqrt(
+            (rgb_white_sum_sq / n_rgb_white) - (rgb_white_mean**2)
+        )
 
-            hsi_mean = hsi_sum / n_hsi
-            hsi_std = torch.sqrt((hsi_sum_sq / n_hsi) - (hsi_mean**2))
+        hsi_mean = hsi_sum / n_hsi
+        hsi_std = torch.sqrt((hsi_sum_sq / n_hsi) - (hsi_mean**2))
