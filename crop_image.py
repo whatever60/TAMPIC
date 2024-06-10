@@ -1,9 +1,7 @@
 import numpy as np
 
 
-def crop_image(
-    img: np.ndarray, center: tuple[int, int], crop_size: int
-) -> np.ndarray:
+def crop_image(img: np.ndarray, center: tuple[int, int], crop_size: int) -> np.ndarray:
     """
     Crop the image centered at the given coordinates.
 
@@ -42,9 +40,12 @@ def crop_image(
     paste_x_end = paste_x_start + (copy_x_end - copy_x_start)
 
     # Copy the relevant region from the original image to the cropped image
-    cropped_image[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = img[copy_y_start:copy_y_end, copy_x_start:copy_x_end]
+    cropped_image[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = img[
+        copy_y_start:copy_y_end, copy_x_start:copy_x_end
+    ]
 
     return cropped_image
+
 
 if __name__ == "__main__":
     # Sample usage

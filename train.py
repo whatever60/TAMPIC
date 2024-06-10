@@ -36,11 +36,11 @@ check_val_every_n_epoch = 10
 amplicon_type, taxon_level = "16s", "genus"
 
 train_config = {
-    "pretrained": {  # hsi is always dropped
+    "pretrained-no_empty-weight_density": { 
         "weight_by_label": True,
         "weight_by_plate": False,
-        "weight_by_density": False,
-        "weight_density_kernel_size": None,
+        "weight_by_density": True,
+        "weight_density_kernel_size": 100,
         "p_num_igs": {1: 2, 2: 2, 3: 1},
         "p_igs": {"rgb-red": 2, "rgb-white": 3, "hsi": 1},
         "p_last_time_point": 0.6,
@@ -51,7 +51,7 @@ train_config = {
         "p_last_time_point_val": 1,
         "p_hsi_channels_val": 1,
         #
-        "keep_empty": True,
+        "keep_empty": False,
         "keep_others": True,
         "pretrained": True,
     },
@@ -133,7 +133,7 @@ train_config = {
         "pretrained": True,
     },
 }
-mode = "pretrained-rgb_only-weight_density"
+mode = "pretrained-no_empty-weight_density"
 
 # Fit the model
 dm = TAMPICDataModule(
@@ -168,7 +168,8 @@ dm = TAMPICDataModule(
     batch_size=batch_size,
     num_workers=10,
     num_batches_per_epoch=num_batches_per_epoch,
-    _hsi_group_k=3,
+    # _hsi_group_k=3,
+    _hsi_crop_size=196,
 )
 dm.setup()
 # Create the model
@@ -183,7 +184,7 @@ model = TAMPICResNetLightningModule(
     wavelengths=dm.hsi_wavelengths,
 )
 today = datetime.today()
-logger = TensorBoardLogger("tb_logs", name=f"{today.strftime('%Y%m%d')}_TAMPIC_{mode}")
+logger = TensorBoardLogger("tb_logs", name=f"{today.strftime('%Y%m%d')}_TAMPIC_{amplicon_type}_{taxon_level}_{mode}")
 lr_monitor = LearningRateMonitor(logging_interval='step')
 # Initialize the Trainer
 trainer = L.Trainer(

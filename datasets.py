@@ -23,7 +23,7 @@ from crop_image import crop_image
 
 
 class _HSINormalize(A.Normalize):
-    def __init__(self, mean: list[float], std: list[float], ceil:int=None):
+    def __init__(self, mean: list[float], std: list[float], ceil: int = None):
         if ceil is not None:
             mean = mean / ceil
         super().__init__(mean, std)
@@ -32,9 +32,11 @@ class _HSINormalize(A.Normalize):
     def __call__(self, **kwargs):
         img = kwargs["image"]
         if not isinstance(img, np.ndarray) and img.dtype == np.uint16:
-            raise ValueError(f"Image must be a numpy array of type uint16, getting {type(img)}")
-        img = img / 2 ** 16
-        
+            raise ValueError(
+                f"Image must be a numpy array of type uint16, getting {type(img)}"
+            )
+        img = img / 2**16
+
         dropout = kwargs["hsi_channel_dropout"]
         mean = np.array(self.mean)
         std = np.array(self.std)
@@ -47,7 +49,7 @@ class GroupTransform:
         self,
         channel_stats: dict[str, dict[str, float]],
         crop_size: int | dict[str, int],
-        hsi_ceil: int=None,
+        hsi_ceil: int = None,
         split: str = "train",
         _calc_stats_mode: bool = False,
         _no_norm: bool = False,
@@ -198,9 +200,7 @@ class GroupTransform:
                             mean=np.zeros_like(
                                 channel_stats["rgb-red"]["mean"]
                             ).tolist(),
-                            std=np.ones_like(
-                                channel_stats["rgb-red"]["std"]
-                            ).tolist(),
+                            std=np.ones_like(channel_stats["rgb-red"]["std"]).tolist(),
                         ),
                         ToTensorV2(),
                     ]
@@ -302,9 +302,11 @@ class ImageDataset(Dataset):
         # size of image patch after augmentation, i.e, network input
         crop_size_final: int | dict[str, int],
         hsi_wavelengths: np.ndarray,
-        hsi_ceil: int=None,
+        hsi_ceil: int = None,
         split: str = "train",
         _hsi_group_k: int = 0,
+        _hsi_crop_size: int = 0,
+        _hsi_coord_digits: int = 3,
         _calc_stats_mode: bool = False,
     ):
         """
@@ -328,18 +330,22 @@ class ImageDataset(Dataset):
         self.hsi_wavelengths = hsi_wavelengths
         self.hsi_ceil = hsi_ceil
         self._hsi_group_k = _hsi_group_k
+        self._hsi_crop_size = _hsi_crop_size
+        self._hsi_coord_digits = _hsi_coord_digits
+        if _hsi_group_k > 0 and _hsi_crop_size > 0:
+            raise ValueError("Cannot specify both _hsi_group_k and _hsi_crop_size.")
 
         self.transform = GroupTransform(
             channel_stats=channel_stats,
             crop_size=crop_size_final,
-        hsi_ceil = hsi_ceil,
+            hsi_ceil=hsi_ceil,
             split=split,
             _calc_stats_mode=_calc_stats_mode,
         )
         self._transform_for_visual = GroupTransform(
             channel_stats=channel_stats,
             crop_size=crop_size_final,
-        hsi_ceil = hsi_ceil,
+            hsi_ceil=hsi_ceil,
             split=split,
             _calc_stats_mode=_calc_stats_mode,
             _no_norm=True,
@@ -404,9 +410,17 @@ class ImageDataset(Dataset):
                 coords_hsi = row[["coord_x_hsi", "coord_y_hsi"]].to_numpy()
                 # For efficiency in cropping and augmentation, we stack all the images
                 # that are not dropped in HSI group.
+                if self._hsi_crop_size:
+                    crop_center = np.array([self._hsi_crop_size] * 2) / 2
+                else:
+                    crop_center = coords_hsi
                 img = crop_image(
-                    self._read_hsi(row[f"rand_image_{ig}_path"], hsi_channel_dropout),
-                    center=coords_hsi,
+                    self._read_hsi(
+                        row[f"rand_image_{ig}_path"],
+                        hsi_channel_dropout,
+                        hsi_coord=coords_hsi,
+                    ),
+                    center=crop_center,
                     crop_size=crop_size_init,
                 )
             else:
@@ -462,13 +476,41 @@ class ImageDataset(Dataset):
                 else:
                     data_aug[ig]["dropped"] = False
                     data_aug[ig]["available"] = False
-        return {"data": data_aug, "label": row["label_clean_idx"]}
 
-    def _read_hsi(self, hsi_path, hsi_channel_dropout, t: int = 4) -> np.ndarray:
+        meta = {
+            "project_id": row["project"],
+            "plate_id": row["plate"],
+            "isolate_id": row["isolate"],
+        }
+
+        return {"data": data_aug, "meta": meta, "label": row["label_clean_idx"]}
+
+    def _read_hsi(
+        self,
+        hsi_path,
+        hsi_channel_dropout,
+        t: int = 4,
+        hsi_coord: tuple[float, float] = None,
+    ) -> np.ndarray:
         read_img_func = lambda x: cv.imread(
             os.path.join(hsi_path, x), cv.IMREAD_UNCHANGED
         )
-        if self._hsi_group_k > 0:
+        if self._hsi_crop_size > 0:
+            # hsi is pre cropped.
+            format_str = "{{:.{}f}}".format(self._hsi_coord_digits)
+            file_name = (
+                format_str.format(hsi_coord[0])
+                + "_"
+                + format_str.format(hsi_coord[1])
+                + "_"
+                + str(self._hsi_crop_size)
+                + ".npz"
+            )
+            img = np.load(os.path.join(hsi_path, file_name))["data"][
+                ..., hsi_channel_dropout
+            ]
+
+        elif self._hsi_group_k > 0:
             # hsi is stored as channel-grouped 16bit tif, for example 3 channels per
             # group, so that they can still be visually inspected. However in this case
             # we should be more cautious about the dropout.
@@ -690,6 +732,7 @@ class TAMPICDataModule(L.LightningDataModule):
         num_batches_per_epoch: Optional[int] = None,
         #
         _hsi_group_k: int = 0,
+        _hsi_crop_size: int = 0,
         _calc_stats_mode: bool = False,
     ):
         """
@@ -764,6 +807,7 @@ class TAMPICDataModule(L.LightningDataModule):
 
         # others
         self._hsi_group_k = _hsi_group_k
+        self._hsi_crop_size = _hsi_crop_size
         self._calc_stats_mode = _calc_stats_mode
 
     def setup(self, stage: Optional[str] = None):
@@ -807,6 +851,7 @@ class TAMPICDataModule(L.LightningDataModule):
             hsi_ceil=self.hsi_ceil,
             split="train",
             _hsi_group_k=self._hsi_group_k,
+            _hsi_crop_size=self._hsi_crop_size,
             _calc_stats_mode=self._calc_stats_mode,
         )
 
@@ -835,6 +880,7 @@ class TAMPICDataModule(L.LightningDataModule):
             hsi_ceil=self.hsi_ceil,
             split="val",
             _hsi_group_k=self._hsi_group_k,
+            _hsi_crop_size=self._hsi_crop_size,
         )
 
         df_val_mid = self._set_randomness(self.df_val_mid, split="val")
@@ -848,6 +894,7 @@ class TAMPICDataModule(L.LightningDataModule):
             hsi_ceil=self.hsi_ceil,
             split="val",
             _hsi_group_k=self._hsi_group_k,
+            _hsi_crop_size=self._hsi_crop_size,
         )
 
         return [
@@ -1376,7 +1423,8 @@ if __name__ == "__main__":
                 batch_size=8,
                 num_workers=0,
                 num_batches_per_epoch=50,
-                _hsi_group_k=3,
+                # _hsi_group_k=3,
+                _hsi_crop_size=196,
             )
             dm.setup()
             dl_train = dm.val_dataloader()[0]

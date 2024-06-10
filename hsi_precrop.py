@@ -26,8 +26,8 @@ with open(f"{base_dir}/{metadata_path}") as f:
 global_properties = metadata["global_properties"]
 num_hsi_channels = global_properties["hsi_num_channels"]
 hsi_wavelengths = np.loadtxt(
-            os.path.join(base_dir, global_properties["hsi_wavelengths"])
-        )
+    os.path.join(base_dir, global_properties["hsi_wavelengths"])
+)
 hsi_ceil = global_properties["hsi_ceil"]
 stats = global_properties["stats"]
 
@@ -43,10 +43,10 @@ for proj, meta_proj in metadata["data"].items():
             continue
         transform_info = meta_plate["isolate_transform"]["to_rgb"]
         func_transform_iso2rgb = get_query2target_func(
-                **transform_info["params"],
-                **transform_info["stats"],
-                flip=transform_info["flip"],
-            )
+            **transform_info["params"],
+            **transform_info["stats"],
+            flip=transform_info["flip"],
+        )
         if "hsi" in meta_plate["images"]:
             time_points_hsi = {
                 int(k[1:]): {
@@ -58,20 +58,27 @@ for proj, meta_proj in metadata["data"].items():
             }
         else:
             continue
-        for dir_, transform_params in time_points_hsi.items():
-            hsi_npz_path = os.path.join(dir_, "..", "..", os.path.basename(dir_))
+        for time_point_info in time_points_hsi.values():
+            dir_ = time_point_info["dir"]
+            transform_params = time_point_info["transform"]
+            hsi_npz_path = os.path.join(
+                dir_, "..", "..", hsi_dir, f"{os.path.basename(dir_)}.npz"
+            )
             hsi_npz = np.load(hsi_npz_path)["data"]
             func_transform_rgb2hsi = get_query2target_func(
                 **transform_params["params"],
                 **transform_params["stats"],
                 flip=transform_params["flip"],
             )
-            for isolate, meta_isolate in amplicon_info[plate].items():
+            for isolate, meta_isolate in tqdm(amplicon_info[plate].items()):
                 coords_iso = np.array([meta_isolate["coord"]])
-                coords_hsi = func_transform_rgb2hsi(func_transform_iso2rgb(coords_iso))[0]
+                coords_hsi = func_transform_rgb2hsi(func_transform_iso2rgb(coords_iso))[
+                    0
+                ]
                 img_iso = crop_image(hsi_npz, center=coords_hsi, crop_size=size)
-                # save npy to trade off space for speed
-                import pdb; pdb.set_trace()
-                output_path = os.path.join(dir_, f"{coords_hsi[0]}_{coords_hsi[1]}_{size}.npy")
-                np.save(output_path, img_iso)
-
+                output_path = os.path.join(
+                    dir_, f"{coords_hsi[0]:.3f}_{coords_hsi[1]:.3f}_{size}.npz"
+                )
+                # save back as npz
+                np.savez_compressed(output_path, data=img_iso)
+                
