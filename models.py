@@ -24,15 +24,35 @@ class TAMPICResNetLightningModule(L.LightningModule):
         total_steps,
         batch_size: int,
         wavelengths,
+        _pretrained_hsi_base: bool = False,
+        _norm_and_sum: bool = True,
     ):
         super(TAMPICResNetLightningModule, self).__init__()
         self.save_hyperparameters()
         if model_type == "resnet18":
-            self.model = resnet18_tampic(num_classes=num_classes, pretrained=pretrained)
+            self.model = resnet18_tampic(
+                num_classes=num_classes,
+                pretrained=pretrained,
+                num_wavelengths=len(wavelengths),
+                _pretrained_hsi_base=_pretrained_hsi_base,
+                _norm_and_sum=_norm_and_sum,
+            )
         elif model_type == "resnet34":
-            self.model = resnet34_tampic(num_classes=num_classes, pretrained=pretrained)
+            self.model = resnet34_tampic(
+                num_classes=num_classes,
+                pretrained=pretrained,
+                num_wavelengths=len(wavelengths),
+                _pretrained_hsi_base=_pretrained_hsi_base,
+                _norm_and_sum=_norm_and_sum,
+            )
         elif model_type == "resnet50":
-            self.model = resnet50_tampic(num_classes=num_classes, pretrained=pretrained)
+            self.model = resnet50_tampic(
+                num_classes=num_classes,
+                pretrained=pretrained,
+                num_wavelengths=len(wavelengths),
+                _pretrained_hsi_base=_pretrained_hsi_base,
+                _norm_and_sum=_norm_and_sum,
+            )
         else:
             raise NotImplementedError(f"Model type {model_type} not implemented")
         self.lr = lr
@@ -129,7 +149,9 @@ class TAMPICResNetLightningModule(L.LightningModule):
         fig, ax = plt.subplots(1, num_val_sets, figsize=(10 * num_val_sets, 10))
         for i in range(num_val_sets):
             cm = self.metric_vals_cm[i].compute().detach().cpu().numpy()
-            sns.heatmap(cm, annot=True, ax=ax[i], square=True, lw=0.5)
+            # normalize the confusion matrix for each true class (row)
+            cm = cm / (cm.sum(axis=1, keepdims=True) + 1e-10)
+            sns.heatmap(cm, ax=ax[i], square=True, lw=0.5, annot=True, fmt=".2f")
             ax[i].set_title(["val_easy", "val_mid"][i])
             # set x and y axis tick labels to actual class names and set x label rotation to 45 degrees
             idx2label = self.trainer.datamodule.idx2label_clean
@@ -141,6 +163,9 @@ class TAMPICResNetLightningModule(L.LightningModule):
         logger.experiment.add_figure("confusion_matrix", fig, self.current_epoch)
         # remove the figure from memory
         plt.close(fig)
+        # reset the confusion matrix (I shouldn't have to do this, but it seems to be necessary)
+        for i in range(num_val_sets):
+            self.metric_vals_cm[i].reset()
 
     def configure_optimizers(self):
         # Separate parameters into pretrained and newly initialized

@@ -15,6 +15,30 @@ sys.path.append("/home/ubuntu/dev/CAMII_dev")
 from data_transform import _crop_array
 
 
+def read_npz_file_and_crop(input_npz_path: str, plate_annot: str=None) -> np.ndarray:
+    """
+    Read a 3D tensor from a .npz file and crop it according to the YOLO annotation.
+
+    Args:
+        input_npz_path (str): Path to the input .npz file.
+        plate_annot (str): Path to the YOLO annotation file.
+
+    Returns:
+        np.ndarray: Cropped 3D tensor.
+    """
+    # Load the .npz file
+    data = np.load(input_npz_path)
+    tensor = data["data"]  # Assuming the data is stored under the key "data"
+
+    if plate_annot is not None:
+        x0, y0, x1, y1 = parse_yolo_annotation(plate_annot)
+        tensor = _crop_array(tensor, [x0, y0, x1, y1])
+
+    # Ensure tensor is in uint16 format
+    tensor = tensor.astype(np.uint16)
+
+    return tensor
+
 def save_grayscale_pngs_from_npz(
     input_npz_path: str,
     output_dir: str,
@@ -28,17 +52,8 @@ def save_grayscale_pngs_from_npz(
         input_npz_path (str): Path to the input .npz file.
         output_dir (str): Directory where the output PNG files will be saved.
     """
-    # Load the .npz file
-    data = np.load(input_npz_path)
-    tensor = data["data"]  # Assuming the data is stored under the key "data"
-
-    if plate_annot is not None:
-        x0, y0, x1, y1 = parse_yolo_annotation(plate_annot)
-        tensor = _crop_array(tensor, [x0, y0, x1, y1])
-
-    # Ensure tensor is in uint16 format
-    tensor = tensor.astype(np.uint16)
-
+    tensor = read_npz_file_and_crop(input_npz_path, plate_annot)
+    
     # Load the corresponding YAML file
     input_npz_base = os.path.splitext(os.path.basename(input_npz_path))[0]
     yaml_path = f"{os.path.splitext(input_npz_path)[0]}.yaml"

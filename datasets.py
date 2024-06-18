@@ -23,25 +23,24 @@ from crop_image import crop_image
 
 
 class _HSINormalize(A.Normalize):
-    def __init__(self, mean: list[float], std: list[float], ceil: int = None):
-        if ceil is not None:
-            mean = mean / ceil
+    def __init__(self, mean: list[float], std: list[float]):
         super().__init__(mean, std)
-        self._to_tensor = T.ToTensor()
+        # self._to_tensor = T.ToTensor()
 
     def __call__(self, **kwargs):
         img = kwargs["image"]
-        if not isinstance(img, np.ndarray) and img.dtype == np.uint16:
-            raise ValueError(
-                f"Image must be a numpy array of type uint16, getting {type(img)}"
-            )
-        img = img / 2**16
+        # if not isinstance(img, np.ndarray) and img.dtype == np.uint16:
+        #     raise ValueError(
+        #         f"Image must be a numpy array of type uint16, getting {type(img)}"
+        #     )
 
         dropout = kwargs["hsi_channel_dropout"]
         mean = np.array(self.mean)
         std = np.array(self.std)
-        img = (img - mean[dropout]) / std[dropout]
-        return {"image": self._to_tensor(img)}
+        img = torch.from_numpy((img - mean[dropout]) / std[dropout]).float().permute(
+            2, 0, 1
+        )
+        return {"image": img}
 
 
 class GroupTransform:
@@ -49,7 +48,6 @@ class GroupTransform:
         self,
         channel_stats: dict[str, dict[str, float]],
         crop_size: int | dict[str, int],
-        hsi_ceil: int = None,
         split: str = "train",
         _calc_stats_mode: bool = False,
         _no_norm: bool = False,
@@ -59,7 +57,7 @@ class GroupTransform:
         self.crop_size = crop_size
 
         def _norm_for_no_norm(**kwargs):
-            kwargs["image"] = kwargs["image"].transpose(2, 0, 1)
+            kwargs["image"] = torch.from_numpy(kwargs["image"].transpose(2, 0, 1))
             return kwargs
 
         if not _calc_stats_mode:
@@ -267,7 +265,9 @@ class GroupTransform:
                     hsi_channel_dropout=data_m["hsi_channel_dropout"],
                 )["image"]
                 image_full = torch.zeros(
-                    (len(data_m["hsi_channel_dropout"]), *image_transformed.shape[1:])
+                    (len(data_m["hsi_channel_dropout"]), *image_transformed.shape[1:]),
+                    dtype=image_transformed.dtype,
+                    device=image_transformed.device,
                 )
                 image_full[data_m["hsi_channel_dropout"]] += image_transformed
                 data_aug[modality] = {
@@ -278,9 +278,7 @@ class GroupTransform:
                     ),
                 }
             else:
-                image_transformed = self.norm[modality](image=image_transformed)[
-                    "image"
-                ]
+                image_transformed = self.norm[modality](image=image_transformed)["image"]
                 data_aug[modality] = {
                     "image": image_transformed,
                     "target_mask": torch.from_numpy(augmented["target_mask"]).float(),
@@ -338,14 +336,14 @@ class ImageDataset(Dataset):
         self.transform = GroupTransform(
             channel_stats=channel_stats,
             crop_size=crop_size_final,
-            hsi_ceil=hsi_ceil,
+            # hsi_ceil=hsi_ceil,
             split=split,
             _calc_stats_mode=_calc_stats_mode,
         )
         self._transform_for_visual = GroupTransform(
             channel_stats=channel_stats,
             crop_size=crop_size_final,
-            hsi_ceil=hsi_ceil,
+            # hsi_ceil=hsi_ceil,
             split=split,
             _calc_stats_mode=_calc_stats_mode,
             _no_norm=True,
@@ -361,9 +359,9 @@ class ImageDataset(Dataset):
         return len(self.df)
 
     def getitem_no_norm(self, idx: int) -> dict[str, torch.Tensor]:
-        self._transform, self.transform = self.transform, self._transform_for_visual
+        _transform, self.transform = self.transform, self._transform_for_visual
         data = self.__getitem__(idx)
-        self.transform, self._transform = self._transform, self.transform
+        self.transform = _transform
         return data
 
     def __getitem__(
@@ -556,6 +554,9 @@ class ImageDataset(Dataset):
                         for wl in self.hsi_wavelengths[hsi_channel_dropout]
                     ]
                 )
+        if self.hsi_ceil is not None:
+            # img = img / self.hsi_ceil
+            img = (img / np.quantile(img, 0.99)).clip(0, 1)
         return img
 
     @staticmethod
@@ -733,6 +734,8 @@ class TAMPICDataModule(L.LightningDataModule):
         #
         _hsi_group_k: int = 0,
         _hsi_crop_size: int = 0,
+        _hsi_norm: int = False,
+        _stats_key: str = "0618_16s",
         _calc_stats_mode: bool = False,
     ):
         """
@@ -808,6 +811,8 @@ class TAMPICDataModule(L.LightningDataModule):
         # others
         self._hsi_group_k = _hsi_group_k
         self._hsi_crop_size = _hsi_crop_size
+        self._hsi_norm = _hsi_norm
+        self._stats_key = _stats_key
         self._calc_stats_mode = _calc_stats_mode
 
     def setup(self, stage: Optional[str] = None):
@@ -936,10 +941,11 @@ class TAMPICDataModule(L.LightningDataModule):
         self.hsi_wavelengths = np.loadtxt(
             os.path.join(metadata_dir, global_properties["hsi_wavelengths"])
         )
-        self.hsi_ceil = global_properties["hsi_ceil"]
+        self._hsi_ceil = global_properties["hsi_ceil"]
+        self.hsi_ceil = self._hsi_ceil if self._hsi_norm else None
         self.taxon_levels = np.array(global_properties["taxonomy_levels"])
         self.taxon_level_idx = np.where(self.taxon_levels == self.taxon_level)[0][0]
-        self.stats = global_properties["stats"]  # for normalization
+        self.stats = global_properties["stats"][self._stats_key]  # for normalization
 
         # load information of each isolate (project id, plate id isolate id, available
         # modalities, available time point for each modality, path to all of the images
@@ -990,6 +996,14 @@ class TAMPICDataModule(L.LightningDataModule):
                         if k != "default" and v["status"] == "valid"
                     }
                     image_groups_info["hsi"] = time_points_hsi
+                image_groups_available = [k for k, v in image_groups_info.items() if v]
+
+                # for removing plates missing nessesary image groups.
+                p = np.array([self.p_igs[ig] for ig in image_groups_available])
+                p_val = np.array([self.p_igs_val[ig] for ig in image_groups_available])
+                if not (p.max() > 0 and p_val.max() > 0):
+                    continue
+
                 for isolate, meta_isolate in amplicon_info[plate].items():
                     if self.amplicon_type not in meta_isolate:
                         continue
@@ -1013,9 +1027,7 @@ class TAMPICDataModule(L.LightningDataModule):
                             # ],
                             # "transform_rgb2hsi": meta_plate["transform"]["rgb_to_hsi"],
                             "image_groups_info": image_groups_info,
-                            "image_groups_available": [
-                                k for k, v in image_groups_info.items() if v
-                            ],
+                            "image_groups_available": image_groups_available,
                             # "available_time_points_rgb-red": available_time_points_rgb-red,
                             # "available_time_points_rgb-white": available_time_points_rgb-white,
                             # "available_time_points_hsi": available_time_points_hsi,
@@ -1294,13 +1306,13 @@ class TAMPICDataModule(L.LightningDataModule):
         df.index = idx
         return df
 
-    def on_epoch_start(self):
-        """
-        Hook to refresh the dataset and set batch indices and dropout patterns.
-        """
-        self.train_df = self.set_randomness(
-            self._sample_training_data(self.train_df_all)
-        )
+    # def on_epoch_start(self):
+    #     """
+    #     Hook to refresh the dataset and set batch indices and dropout patterns.
+    #     """
+    #     self.train_df = self.set_randomness(
+    #         self._sample_training_data(self.train_df_all)
+    #     )
 
 
 def get_isolate_label(
@@ -1388,6 +1400,20 @@ if __name__ == "__main__":
 
     parser_test = subparsers.add_parser("test")
     parser_calc_stats = subparsers.add_parser("calc_stats")
+    parser_calc_stats.add_argument(
+        "--amplicon_type",
+        type=str,
+        required=True,
+        choices=["16s", "its"],
+        help="Type of amplicon sequencing data to use.",
+    )
+    parser_calc_stats.add_argument(
+        "--taxon_level",
+        type=str,
+        required=True,
+        choices=["genus", "species"],
+        help="Taxonomic level to use.",
+    )
 
     args = parser.parse_args()
 
@@ -1425,6 +1451,7 @@ if __name__ == "__main__":
                 num_batches_per_epoch=50,
                 # _hsi_group_k=3,
                 _hsi_crop_size=196,
+                _hsi_norm=True,
             )
             dm.setup()
             dl_train = dm.val_dataloader()[0]
@@ -1444,6 +1471,8 @@ if __name__ == "__main__":
                 f"p_hsichannels = {dm.p_hsi_channels}"
             )
     elif args.command == "calc_stats":
+        amplicon_type = args.amplicon_type
+        taxon_level = args.taxon_level
         # in this subcommand, we calculate the mean and std of each channel.
         # No data augmentation or image group dropout or hsi channel dropout is applied
         # in this subcommand. All samples have the same sampling weight. Empty
@@ -1464,68 +1493,73 @@ if __name__ == "__main__":
         n_rgb_red = torch.zeros(num_channels_rgb_red)
         n_rgb_white = torch.zeros(num_channels_rgb_white)
         n_hsi = torch.zeros(num_channels_hsi)
-        for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
-            if amplicon_type == "16s":
-                continue
-            dm = TAMPICDataModule(
-                metadata_train_path=f"{base_dir}/all_0531.json",
-                weight_by_label=False,
-                weight_by_density=False,
-                weight_density_kernel_size=None,
-                weight_by_plate=False,
-                p_num_igs={1: 0, 2: 0, 3: 1},
-                # p_igs=None,
-                p_last_time_point=0.6,
-                p_hsi_channels=1,
-                rng_seed=42,
-                amplicon_type=amplicon_type,
-                taxon_level=taxon_level,
-                min_counts=10,
-                min_counts_dominate=0,
-                min_ratio=2,
-                min_num_isolates=30,
-                keep_empty=False,
-                keep_others=True,
-                crop_size_init={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
-                crop_size_final=None,
-                target_mask_kernel_size=5,
-                num_devices=1,
-                batch_size=4,
-                num_workers=12,
-                num_batches_per_epoch=-1,
-                _hsi_group_k=3,
-                _calc_stats_mode=True,
-            )
-            dm.setup()
-            dl_train = dm.train_dataloader()
+        L.seed_everything(2024)
+        rng_seed = 42
+        dm = TAMPICDataModule(
+            metadata_train_path=f"{base_dir}/all_0531.json",
+            weight_by_label=False,
+            weight_by_density=False,
+            weight_density_kernel_size=None,
+            weight_by_plate=False,
+            p_num_igs={1: 0, 2: 0, 3: 1},
+            # p_igs=None,
+            p_last_time_point=0.6,
+            p_hsi_channels=1,
+            rng_seed=rng_seed,
+            amplicon_type=amplicon_type,
+            taxon_level=taxon_level,
+            min_counts=10,
+            min_counts_dominate=0,
+            min_purity=0.1,
+            min_ratio=2,
+            min_num_isolates=30,
+            keep_empty=False,
+            keep_others=True,
+            crop_size_init={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
+            crop_size_final={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
+            target_mask_kernel_size=5,
+            num_devices=1,
+            batch_size=8,
+            num_workers=12,
+            num_batches_per_epoch=-1,
+            # _hsi_group_k=3,
+            _hsi_crop_size=196,
+            _hsi_norm=True,
+            _calc_stats_mode=True,
+        )
+        dm.setup()
+        dl_train = dm.train_dataloader()
 
-            # Iterate over the batches
-            for batch in tqdm(dl_train):
-                rgb_red_images = batch["data"]["rgb-red"]["image"]
-                rgb_white_images = batch["data"]["rgb-white"]["image"]
-                hsi_images = batch["data"]["hsi"]["image"]
-                rgb_red_dropped = batch["data"]["rgb-red"]["dropped"]
-                rgb_white_dropped = batch["data"]["rgb-white"]["dropped"]
-                hsi_dropped = batch["data"]["hsi"]["dropped"]
+        # Iterate over the batches
+        for batch in tqdm(dl_train):
+            rgb_red_images = batch["data"]["rgb-red"]["image"]
+            rgb_white_images = batch["data"]["rgb-white"]["image"]
+            hsi_images = batch["data"]["hsi"]["image"]
+            rgb_red_available = batch["data"]["rgb-red"]["available"]
+            rgb_white_available = batch["data"]["rgb-white"]["available"]
+            hsi_available = batch["data"]["hsi"]["available"]
+            rgb_red_dropped = batch["data"]["rgb-red"]["dropped"]
+            rgb_white_dropped = batch["data"]["rgb-white"]["dropped"]
+            hsi_dropped = batch["data"]["hsi"]["dropped"]
 
-                for i in range(len(rgb_red_images)):
-                    if not rgb_red_dropped[i]:
-                        rgb_red_img = rgb_red_images[i]
-                        rgb_red_sum += rgb_red_img.sum(dim=(1, 2))
-                        rgb_red_sum_sq += (rgb_red_img**2).sum(dim=(1, 2))
-                        n_rgb_red += rgb_red_img[0].numel()
+            for i in range(len(rgb_red_images)):  # loop over batch size
+                if rgb_red_available[i] and not rgb_red_dropped[i]:
+                    rgb_red_img = rgb_red_images[i]
+                    rgb_red_sum += rgb_red_img.sum(dim=(1, 2))
+                    rgb_red_sum_sq += (rgb_red_img**2).sum(dim=(1, 2))
+                    n_rgb_red += rgb_red_img[0].numel()
 
-                    if not rgb_white_dropped[i]:
-                        rgb_white_img = rgb_white_images[i]
-                        rgb_white_sum += rgb_white_img.sum(dim=(1, 2))
-                        rgb_white_sum_sq += (rgb_white_img**2).sum(dim=(1, 2))
-                        n_rgb_white += rgb_white_img[0].numel()
+                if rgb_white_available[i] and not rgb_white_dropped[i]:
+                    rgb_white_img = rgb_white_images[i]
+                    rgb_white_sum += rgb_white_img.sum(dim=(1, 2))
+                    rgb_white_sum_sq += (rgb_white_img**2).sum(dim=(1, 2))
+                    n_rgb_white += rgb_white_img[0].numel()
 
-                    if not hsi_dropped[i]:
-                        hsi_img = hsi_images[i]
-                        hsi_sum += hsi_img.sum(dim=(1, 2))
-                        hsi_sum_sq += (hsi_img**2).sum(dim=(1, 2))
-                        n_hsi += hsi_img[0].numel()
+                if hsi_available[i] and not hsi_dropped[i]:
+                    hsi_img = hsi_images[i]
+                    hsi_sum += hsi_img.sum(dim=(1, 2))
+                    hsi_sum_sq += (hsi_img**2).sum(dim=(1, 2))
+                    n_hsi += hsi_img[0].numel()
 
         # Calculate mean and standard deviation
         rgb_red_mean = rgb_red_sum / n_rgb_red

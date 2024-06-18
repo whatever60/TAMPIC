@@ -6,13 +6,17 @@ import torch.nn.functional as F
 import lightning as L
 from torch.optim import AdamW
 from schedulers import WarmupScheduler
-from pytorch_lightning.loggers import TensorBoardLogger
-from lightning.pytorch.callbacks import LearningRateMonitor
+from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.callbacks import (
+    LearningRateMonitor,
+    ModelCheckpoint,
+    ModelSummary,
+)
 from sklearn.metrics import confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-
+from ema import EMA
 from models import TAMPICResNetLightningModule
 from datasets import TAMPICDataModule
 
@@ -27,16 +31,16 @@ lr = 1e-3
 crop_size_final = 128
 warmup_steps = 1000
 max_epochs = 2_000
-batch_size = 8
-num_batches_per_epoch = 50
 num_devices = 1
+batch_size = 8
 grad_accum = 4
+num_batches_per_epoch = 50
 check_val_every_n_epoch = 10
 
 amplicon_type, taxon_level = "16s", "genus"
 
 train_config = {
-    "pretrained-no_empty-weight_density": { 
+    "pretrained-no_empty-weight_density": {
         "weight_by_label": True,
         "weight_by_plate": False,
         "weight_by_density": True,
@@ -112,7 +116,7 @@ train_config = {
         "keep_others": True,
         "pretrained": True,
     },
-    'pretrained-hsi_only': {
+    "pretrained-hsi_only-no_empty": {
         "weight_by_label": True,
         "weight_by_plate": False,
         "weight_by_density": False,
@@ -128,12 +132,34 @@ train_config = {
         "p_last_time_point_val": 1,
         "p_hsi_channels_val": 1,
         #
-        "keep_empty": True,
+        "keep_empty": False,
         "keep_others": True,
         "pretrained": True,
     },
+    "pretrained-hsi_only-no_empty-pretrained_hsi_base": {
+        "weight_by_label": True,
+        "weight_by_plate": False,
+        "weight_by_density": False,
+        "weight_density_kernel_size": None,
+        #
+        "p_num_igs": {1: 1, 2: 0, 3: 0},
+        "p_igs": {"rgb-red": 0, "rgb-white": 0, "hsi": 1},
+        "p_last_time_point": 0.6,
+        "p_hsi_channels": 0.2,
+        #
+        "p_num_igs_val": {1: 1, 2: 0, 3: 0},
+        "p_igs_val": {"rgb-red": 0, "rgb-white": 0, "hsi": 1},
+        "p_last_time_point_val": 1,
+        "p_hsi_channels_val": 1,
+        #
+        "keep_empty": False,
+        "keep_others": True,
+        "pretrained": True,
+        "_pretrained_hsi_base": True,
+        "_norm_and_sum": True,
+    },
 }
-mode = "pretrained-no_empty-weight_density"
+mode = "pretrained-hsi_only-no_empty-pretrained_hsi_base"
 
 # Fit the model
 dm = TAMPICDataModule(
@@ -166,7 +192,7 @@ dm = TAMPICDataModule(
     target_mask_kernel_size=5,
     num_devices=num_devices,
     batch_size=batch_size,
-    num_workers=10,
+    num_workers=16,
     num_batches_per_epoch=num_batches_per_epoch,
     # _hsi_group_k=3,
     _hsi_crop_size=196,
@@ -182,18 +208,37 @@ model = TAMPICResNetLightningModule(
     total_steps=math.ceil(max_epochs * dm._num_batches_per_epoch / grad_accum),
     batch_size=batch_size,
     wavelengths=dm.hsi_wavelengths,
+    _pretrained_hsi_base=train_config[mode].get("_pretrained_hsi_base", False),
+    _norm_and_sum=train_config[mode].get("_norm_and_sum", False),
 )
 today = datetime.today()
-logger = TensorBoardLogger("tb_logs", name=f"{today.strftime('%Y%m%d')}_TAMPIC_{amplicon_type}_{taxon_level}_{mode}")
-lr_monitor = LearningRateMonitor(logging_interval='step')
+logger = TensorBoardLogger(
+    "tb_logs",
+    name=f"{today.strftime('%Y%m%d')}_TAMPIC_{amplicon_type}_{taxon_level}_{mode}",
+)
+lr_monitor = LearningRateMonitor(logging_interval="step")
+ckpt_callback = ModelCheckpoint(
+    monitor="val_easy_acc/dataloader_idx_0",
+    filename="best_model",
+    save_top_k=3,
+    save_last=1,
+    mode="max",
+    every_n_epochs=check_val_every_n_epoch * 5,
+)
+ema_callback = EMA(decay=0.999)
+model_summary_callback = ModelSummary(max_depth=3)
 # Initialize the Trainer
 trainer = L.Trainer(
     logger=logger,
-    callbacks=[lr_monitor],
+    callbacks=[lr_monitor, ckpt_callback, ema_callback, model_summary_callback],
     max_epochs=max_epochs,
     accumulate_grad_batches=grad_accum,
     reload_dataloaders_every_n_epochs=1,
     check_val_every_n_epoch=check_val_every_n_epoch,
     # gpus=0,  # if using GPU
 )
-trainer.fit(model, datamodule=dm)
+trainer.fit(
+    model,
+    datamodule=dm,
+    # ckpt_path="/home/ubuntu/dev/TAMPIC/tb_logs/20240610_TAMPIC_16s_genus_pretrained-no_empty-weight_density/version_1/checkpoints/epoch=1259-step=16380.ckpt",
+)
