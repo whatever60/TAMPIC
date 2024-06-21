@@ -1,10 +1,14 @@
+import os
+import numpy as np
+import pandas as pd
 import torch
 from torch.optim import AdamW
 from torch import nn
 import torch.nn.functional as F
 import lightning as L
-import torchmetrics
-from torchmetrics.classification import MulticlassConfusionMatrix
+from torchmetrics import MetricCollection
+from torchmetrics.classification import MulticlassConfusionMatrix, MulticlassAccuracy
+from torchmetrics.aggregation import CatMetric
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -26,6 +30,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
         wavelengths,
         _pretrained_hsi_base: bool = False,
         _norm_and_sum: bool = True,
+        _prediction_log_dir: str = None,
     ):
         super(TAMPICResNetLightningModule, self).__init__()
         self.save_hyperparameters()
@@ -61,29 +66,52 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self.batch_size = batch_size
         self.pretrained = pretrained
         self.wavelengths = torch.from_numpy(wavelengths).float() / 1000 * 2 - 1
-        self.metric_train_acc = torchmetrics.classification.Accuracy(
-            task="multiclass", num_classes=num_classes
+        metrics_acc = MetricCollection(
+            {
+                "top1_acc": MulticlassAccuracy(num_classes=num_classes, top_k=1),
+                "top3_acc": MulticlassAccuracy(num_classes=num_classes, top_k=3),
+            }
         )
-        self.metric_vals_acc = nn.ModuleList(
-            [
-                torchmetrics.classification.Accuracy(
-                    task="multiclass", num_classes=num_classes
-                ),
-                torchmetrics.classification.Accuracy(
-                    task="multiclass", num_classes=num_classes
-                ),
-            ]
+        self.metrics_acc_train = metrics_acc.clone(prefix="train_")
+        self.metrics_acc_val_easy = metrics_acc.clone(prefix="val-easy")
+        self.metrics_acc_val_mid = metrics_acc.clone(prefix="val-mid")
+        self.metric_cm_val_easy = MulticlassConfusionMatrix(num_classes=num_classes)
+        self.metric_cm_val_mid = MulticlassConfusionMatrix(num_classes=num_classes)
+
+        # logging the prediction of the model, but using metrics to implement the logic
+        if _prediction_log_dir is None:
+            return
+        os.makedirs(_prediction_log_dir, exist_ok=True)
+        self._prediction_log_dir = _prediction_log_dir
+        logger_prediction = nn.ModuleDict(
+            {
+                "epoch": CatMetric(),
+                "batch_idx": CatMetric(),
+                "device": CatMetric(),
+                "index_in_df": CatMetric(),
+                "label": CatMetric(),
+                "logits": CatMetric(),
+                "project_id": CatMetric(),
+                "plate_id": CatMetric(),
+                "sample_id": CatMetric(),
+            }
         )
-        self.metric_vals_cm = nn.ModuleList(
-            [
-                torchmetrics.classification.MulticlassConfusionMatrix(
-                    num_classes=num_classes
-                ),
-                torchmetrics.classification.MulticlassConfusionMatrix(
-                    num_classes=num_classes
-                ),
-            ]
-        )
+        self.logger_prediction_train = {
+            k: v.clone() for k, v in logger_prediction.items()
+        }
+        self.logger_prediction_val_easy = {
+            k: v.clone() for k, v in logger_prediction.items()
+        }
+        self.logger_prediction_val_mid = {
+            k: v.clone() for k, v in logger_prediction.items()
+        }
+
+        device = self.device.index
+        if device is None:
+            device = 0
+        self._device_idx = device
+        # self.device_str = f"{self.device.type}:{device}"
+
 
     def forward(self, data, wavelengths):
         return self.model(data, wavelengths)
@@ -91,14 +119,13 @@ class TAMPICResNetLightningModule(L.LightningModule):
     def training_step(self, batch, batch_idx):
         data = batch["data"]
         label = batch["label"]
+        print("----------")
         logits = self(data, self.wavelengths.to(self.device))
+        print("++++++++++")
         loss = F.cross_entropy(logits, label)
-        # log loss and accuracy
-        preds = logits.argmax(dim=1)
-        self.metric_train_acc(preds, label)
-        self.log(
-            "train_acc",
-            self.metric_train_acc,
+        self.metrics_acc_train.update(logits, label)
+        self.log_dict(
+            self.metrics_acc_train,
             on_step=True,
             on_epoch=True,
             batch_size=self.batch_size,
@@ -106,26 +133,95 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self.log(
             "train_loss", loss, on_step=True, on_epoch=True, batch_size=self.batch_size
         )
+
+        self._update_prediction_on_step_end(
+            dataset="train",
+            batch_idx=batch_idx,
+            label=label,
+            logits=logits,
+            meta=batch["meta"],
+        )
         return loss
+
+    def _update_prediction_on_step_end(
+        self, dataset: str, batch_idx, label, logits, meta: dict
+    ) -> None:
+        if dataset == "train":
+            logger_prediction = self.logger_prediction_train
+        elif dataset == "val_easy":
+            logger_prediction = self.logger_prediction_val_easy
+        elif dataset == "val_mid":
+            logger_prediction = self.logger_prediction_val_mid
+        else:
+            raise ValueError(f"Invalid dataset: {dataset}")
+        batch_size = label.size(0)
+        logger_prediction["epoch"].update(torch.full((batch_size,), self.current_epoch))
+        logger_prediction["batch_idx"].update(torch.full((batch_size,), batch_idx))
+        logger_prediction["device"].update(torch.full((batch_size,), self._device_idx))
+        logger_prediction["label"].update(label)
+        logger_prediction["logits"].update(logits.detach())
+        logger_prediction["index_in_df"].update(meta["index_in_df"])
+        # logger_prediction["project_id"].update(meta["project_id"])
+        # logger_prediction["plate_id"].update(meta["plate_id"])
+        # logger_prediction["sample_id"].update(meta["sample_id"])
+
+    def _save_prediction_on_epoch_end(self, dataset: str) -> None:
+        if dataset == "train":
+            logger_prediction = self.logger_prediction_train
+            prefix = "train"
+        elif dataset == "val-easy":
+            logger_prediction = self.logger_prediction_val_easy
+            prefix = "val-easy"
+        elif dataset == "val-mid":
+            logger_prediction = self.logger_prediction_val_mid
+            prefix = "val-mid"
+        else:
+            raise ValueError(f"Invalid dataset: {dataset}")
+
+        logits = logger_prediction["logits"].compute().cpu().numpy()
+        try:
+            idx2label_clean = self.trainer.datamodule.idx2label_clean
+            columns = [idx2label_clean[i] for i in range(len(idx2label_clean))]
+        except AttributeError:
+            columns = np.arange(logits.shape[1])
+        indexs = logger_prediction["index_in_df"].compute().cpu().numpy()
+        logits_df = pd.DataFrame(logits, columns=columns, index=indexs)
+        other_info_df = pd.DataFrame(
+            {
+                "epoch": logger_prediction["epoch"].compute(),
+                "label": logger_prediction["label"].compute(),
+                # "project_id": logger_prediction["project_id"].compute(),
+                # "plate_id": logger_prediction["plate_id"].compute(),
+                # "sample_id": logger_prediction["sample_id"].compute(),
+            },
+            index=indexs,
+        )
+        logits_df.to_csv(
+            f"{self._prediction_log_dir}/{prefix}_logits_epoch_{self.current_epoch}.csv"
+        )
+        other_info_df.to_csv(
+            f"{self._prediction_log_dir}/{prefix}_info_epoch_{self.current_epoch}.csv"
+        )
+        for m in logger_prediction.values():
+            m.reset()
+
+    def on_training_epoch_end(self) -> None:
+        self._save_prediction_on_epoch_end("train")
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         data = batch["data"]
         label = batch["label"]
         logits = self(data, self.wavelengths.to(self.device))
         loss = F.cross_entropy(logits, label)
-        preds = logits.argmax(dim=1)
-        metric_val_acc = self.metric_vals_acc[dataloader_idx]
-        metric_val_cm = self.metric_vals_cm[dataloader_idx]
+        if dataloader_idx == 0:
+            metric_val_acc = self.metrics_acc_val_easy
+            metric_val_cm = self.metric_cm_val_easy
+        else:
+            metric_val_acc = self.metrics_acc_val_mid
+            metric_val_cm = self.metric_cm_val_mid
+        metric_val_acc.update(logits, label)
+        metric_val_cm.update(logits, label)
         metric_name = ["val_easy_{}", "val_mid_{}"][dataloader_idx]
-        metric_val_acc(preds, label)
-        metric_val_cm(preds, label)
-        self.log(
-            metric_name.format("acc"),
-            metric_val_acc,
-            on_step=False,
-            on_epoch=True,
-            batch_size=self.batch_size,
-        )
         self.log(
             metric_name.format("loss"),
             loss,
@@ -133,22 +229,39 @@ class TAMPICResNetLightningModule(L.LightningModule):
             on_epoch=True,
             batch_size=self.batch_size,
         )
-        return {
-            "loss": loss,
-            "preds": preds,
-            "targets": label,
-            "dataloader_idx": dataloader_idx,
-        }
+
+        self._update_prediction_on_step_end(
+            dataset=["val_easy", "val_mid"][dataloader_idx],
+            batch_idx=batch_idx,
+            label=label,
+            logits=logits,
+            meta=batch["meta"],
+        )
+        return loss
 
     def on_validation_epoch_end(self) -> None:
+        # log scalar metrics. compuate, log, reset
+        acc_val_easy = self.metrics_acc_val_easy.compute()
+        acc_val_mid = self.metrics_acc_val_mid.compute()
+        self.log_dict(acc_val_easy)
+        self.log_dict(acc_val_mid)
+        self.metrics_acc_val_easy.reset()
+        self.metrics_acc_val_mid.reset()
+
+        # log the confusion matrix to tensorboard
         try:
             logger = self.logger
         except AttributeError:
             return
-        num_val_sets = len(self.metric_vals_acc)
-        fig, ax = plt.subplots(1, num_val_sets, figsize=(10 * num_val_sets, 10))
-        for i in range(num_val_sets):
-            cm = self.metric_vals_cm[i].compute().detach().cpu().numpy()
+
+        num_val_sets = 2
+        fig, ax = plt.subplots(1, num_val_sets, figsize=(15 * num_val_sets, 15))
+        for i, metric_cm in enumerate(
+            [self.metric_cm_val_easy, self.metric_cm_val_mid]
+        ):
+            cm = metric_cm.compute().detach().cpu().numpy()
+            # reset the confusion matrix (I shouldn't have to do this, but it seems to be necessary)
+            metric_cm.reset()
             # normalize the confusion matrix for each true class (row)
             cm = cm / (cm.sum(axis=1, keepdims=True) + 1e-10)
             sns.heatmap(cm, ax=ax[i], square=True, lw=0.5, annot=True, fmt=".2f")
@@ -161,11 +274,10 @@ class TAMPICResNetLightningModule(L.LightningModule):
             ax[i].set_xlabel("Predicted")
             ax[i].set_ylabel("True")
         logger.experiment.add_figure("confusion_matrix", fig, self.current_epoch)
-        # remove the figure from memory
         plt.close(fig)
-        # reset the confusion matrix (I shouldn't have to do this, but it seems to be necessary)
-        for i in range(num_val_sets):
-            self.metric_vals_cm[i].reset()
+
+        self._save_prediction_on_epoch_end("val-easy")
+        self._save_prediction_on_epoch_end("val-mid")
 
     def configure_optimizers(self):
         # Separate parameters into pretrained and newly initialized
