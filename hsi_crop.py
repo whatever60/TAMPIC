@@ -8,11 +8,13 @@ from tqdm.auto import tqdm
 import pandas as pd
 
 
-def parse_yolo_annotation(annotation_file: str):
+def parse_yolo_annotation(annotation_file: str, shrink: float = 1):
+    if not 0 < shrink <= 1:
+        raise ValueError("Shrink factor must be between 0 and 1.")
     df = pd.read_csv(annotation_file, sep=" ", header=None)
     x_c, y_c, w, h = df.iloc[0, 1:].astype(float)
-    w *= 0.9
-    h *= 0.9
+    w *= shrink
+    h *= shrink
     x0 = x_c - w / 2
     y0 = y_c - h / 2
     x1 = x_c + w / 2
