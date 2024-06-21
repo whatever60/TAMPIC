@@ -1,5 +1,6 @@
 from datetime import datetime
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -27,15 +28,17 @@ base_dir = "/mnt/c/aws_data/data/camii"
 base_dir = "/home/ubuntu/data/camii"
 
 # hparams
-lr = 1e-3
-crop_size_final = 128
-warmup_steps = 1000
-max_epochs = 2_000
+lr = 2e-3
+max_epochs = 1_000
+num_batches_per_epoch = 100
 num_devices = 1
-batch_size = 8
-grad_accum = 4
-num_batches_per_epoch = 50
+batch_size = 32  # per device batch size before gradient accumulation
+grad_accum = 2
+warmup_steps = 2000
 check_val_every_n_epoch = 10
+
+crop_size_init = {"rgb-red": 224, "rgb-white": 224, "hsi": 128}
+crop_size_final = 128
 
 amplicon_type, taxon_level = "16s", "genus"
 
@@ -58,6 +61,32 @@ train_config = {
         "keep_empty": False,
         "keep_others": True,
         "pretrained": True,
+        "_pretrained_hsi_base": True,
+        "_norm_and_sum": True,
+    },
+    "pretrained-no_empty-weight_density-small": {
+        "weight_by_label": True,
+        "weight_by_plate": False,
+        "weight_by_density": True,
+        "weight_density_kernel_size": 100,
+        "p_num_igs": {1: 2, 2: 2, 3: 1},
+        "p_igs": {"rgb-red": 2, "rgb-white": 3, "hsi": 1},
+        "p_last_time_point": 0.6,
+        "p_hsi_channels": 0.2,
+        #
+        "p_num_igs_val": {1: 0, 2: 0, 3: 1},
+        "p_igs_val": {"rgb-red": 1, "rgb-white": 1, "hsi": 1},
+        "p_last_time_point_val": 1,
+        "p_hsi_channels_val": 1,
+        #
+        "crop_size_init": {"rgb-red": 128, "rgb-white": 128, "hsi": 96},
+        "crop_size_final": 96,
+        #
+        "keep_empty": False,
+        "keep_others": True,
+        "pretrained": True,
+        "_pretrained_hsi_base": True,
+        "_norm_and_sum": True,
     },
     "pretrained-rgb_only": {  # hsi is always dropped
         "weight_by_label": True,
@@ -159,7 +188,7 @@ train_config = {
         "_norm_and_sum": True,
     },
 }
-mode = "pretrained-hsi_only-no_empty-pretrained_hsi_base"
+mode = "pretrained-no_empty-weight_density"
 
 # Fit the model
 dm = TAMPICDataModule(
@@ -187,30 +216,20 @@ dm = TAMPICDataModule(
     min_num_isolates=30,
     keep_empty=train_config[mode]["keep_empty"],
     keep_others=train_config[mode]["keep_others"],
-    crop_size_init={"rgb-red": 224, "rgb-white": 224, "hsi": 128},
-    crop_size_final=crop_size_final,
+    crop_size_init=train_config[mode].get("crop_size_init", crop_size_init),
+    crop_size_final=train_config[mode].get("crop_size_final", crop_size_final),
     target_mask_kernel_size=5,
     num_devices=num_devices,
     batch_size=batch_size,
-    num_workers=16,
+    num_workers=8,
     num_batches_per_epoch=num_batches_per_epoch,
     # _hsi_group_k=3,
     _hsi_crop_size=196,
+    _hsi_norm=True,
 )
 dm.setup()
-# Create the model
-model = TAMPICResNetLightningModule(
-    model_type="resnet18",
-    num_classes=len(dm.label_clean2idx),
-    lr=lr,
-    pretrained=train_config[mode]["pretrained"],
-    warmup_steps=warmup_steps,
-    total_steps=math.ceil(max_epochs * dm._num_batches_per_epoch / grad_accum),
-    batch_size=batch_size,
-    wavelengths=dm.hsi_wavelengths,
-    _pretrained_hsi_base=train_config[mode].get("_pretrained_hsi_base", False),
-    _norm_and_sum=train_config[mode].get("_norm_and_sum", False),
-)
+
+# setup callbacks
 today = datetime.today()
 logger = TensorBoardLogger(
     "tb_logs",
@@ -226,7 +245,23 @@ ckpt_callback = ModelCheckpoint(
     every_n_epochs=check_val_every_n_epoch * 5,
 )
 ema_callback = EMA(decay=0.999)
-model_summary_callback = ModelSummary(max_depth=3)
+model_summary_callback = ModelSummary(max_depth=2)
+
+# Create the model
+model = TAMPICResNetLightningModule(
+    model_type="resnet18",
+    num_classes=len(dm.label_clean2idx),
+    lr=lr,
+    pretrained=train_config[mode]["pretrained"],
+    warmup_steps=warmup_steps,
+    total_steps=math.ceil(max_epochs * num_batches_per_epoch / grad_accum),
+    batch_size=batch_size,
+    wavelengths=dm.hsi_wavelengths,
+    _pretrained_hsi_base=train_config[mode].get("_pretrained_hsi_base", False),
+    _norm_and_sum=train_config[mode].get("_norm_and_sum", False),
+    _prediction_log_dir=os.path.join(logger.log_dir, "predictions"),
+)
+
 # Initialize the Trainer
 trainer = L.Trainer(
     logger=logger,
@@ -235,6 +270,7 @@ trainer = L.Trainer(
     accumulate_grad_batches=grad_accum,
     reload_dataloaders_every_n_epochs=1,
     check_val_every_n_epoch=check_val_every_n_epoch,
+    num_sanity_val_steps=0,
     # gpus=0,  # if using GPU
 )
 trainer.fit(
