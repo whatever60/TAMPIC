@@ -17,11 +17,11 @@ import os
 import threading
 from typing import Any, Dict, Iterable
 
-import pytorch_lightning as pl
+import lightning as L
 import torch
-from pytorch_lightning import Callback
-from pytorch_lightning.utilities.exceptions import MisconfigurationException
-from pytorch_lightning.utilities.rank_zero import rank_zero_info
+from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.utilities.exceptions import MisconfigurationException
+from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
 
 class EMA(Callback):
@@ -49,7 +49,7 @@ class EMA(Callback):
         self.every_n_steps = every_n_steps
         self.cpu_offload = cpu_offload
 
-    def on_fit_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+    def on_fit_start(self, trainer: "L.Trainer", pl_module: "L.LightningModule") -> None:
         device = pl_module.device if not self.cpu_offload else torch.device('cpu')
         trainer.optimizers = [
             EMAOptimizer(
@@ -63,35 +63,35 @@ class EMA(Callback):
             if not isinstance(optim, EMAOptimizer)
         ]
 
-    def on_validation_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+    def on_validation_start(self, trainer: "L.Trainer", pl_module: "L.LightningModule") -> None:
         if self._should_validate_ema_weights(trainer):
             self.swap_model_weights(trainer)
 
-    def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+    def on_validation_end(self, trainer: "L.Trainer", pl_module: "L.LightningModule") -> None:
         if self._should_validate_ema_weights(trainer):
             self.swap_model_weights(trainer)
 
-    def on_test_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+    def on_test_start(self, trainer: "L.Trainer", pl_module: "L.LightningModule") -> None:
         if self._should_validate_ema_weights(trainer):
             self.swap_model_weights(trainer)
 
-    def on_test_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+    def on_test_end(self, trainer: "L.Trainer", pl_module: "L.LightningModule") -> None:
         if self._should_validate_ema_weights(trainer):
             self.swap_model_weights(trainer)
 
-    def _should_validate_ema_weights(self, trainer: "pl.Trainer") -> bool:
+    def _should_validate_ema_weights(self, trainer: "L.Trainer") -> bool:
         return not self.validate_original_weights and self._ema_initialized(trainer)
 
-    def _ema_initialized(self, trainer: "pl.Trainer") -> bool:
+    def _ema_initialized(self, trainer: "L.Trainer") -> bool:
         return any(isinstance(optimizer, EMAOptimizer) for optimizer in trainer.optimizers)
 
-    def swap_model_weights(self, trainer: "pl.Trainer", saving_ema_model: bool = False):
+    def swap_model_weights(self, trainer: "L.Trainer", saving_ema_model: bool = False):
         for optimizer in trainer.optimizers:
             assert isinstance(optimizer, EMAOptimizer)
             optimizer.switch_main_parameter_weights(saving_ema_model)
 
     @contextlib.contextmanager
-    def save_ema_model(self, trainer: "pl.Trainer"):
+    def save_ema_model(self, trainer: "L.Trainer"):
         """
         Saves an EMA copy of the model + EMA optimizer states for resume.
         """
@@ -102,7 +102,7 @@ class EMA(Callback):
             self.swap_model_weights(trainer, saving_ema_model=False)
 
     @contextlib.contextmanager
-    def save_original_optimizer_state(self, trainer: "pl.Trainer"):
+    def save_original_optimizer_state(self, trainer: "L.Trainer"):
         for optimizer in trainer.optimizers:
             assert isinstance(optimizer, EMAOptimizer)
             optimizer.save_original_optimizer_state = True
@@ -113,7 +113,7 @@ class EMA(Callback):
                 optimizer.save_original_optimizer_state = False
 
     def on_load_checkpoint(
-        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", checkpoint: Dict[str, Any]
+        self, trainer: "L.Trainer", pl_module: "L.LightningModule", checkpoint: Dict[str, Any]
     ) -> None:
         checkpoint_callback = trainer.checkpoint_callback
 
