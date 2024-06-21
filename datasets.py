@@ -16,6 +16,7 @@ import cv2 as cv
 from PIL import Image
 from tqdm.auto import tqdm
 from rich import print as rprint
+from tabulate import tabulate
 from joblib import Parallel, delayed
 
 from affine_transform import get_query2target_func
@@ -37,8 +38,10 @@ class _HSINormalize(A.Normalize):
         dropout = kwargs["hsi_channel_dropout"]
         mean = np.array(self.mean)
         std = np.array(self.std)
-        img = torch.from_numpy((img - mean[dropout]) / std[dropout]).float().permute(
-            2, 0, 1
+        img = (
+            torch.from_numpy((img - mean[dropout]) / std[dropout])
+            .float()
+            .permute(2, 0, 1)
         )
         return {"image": img}
 
@@ -139,9 +142,11 @@ class GroupTransform:
                                 A.RandomBrightnessContrast(p=0.5),
                                 A.OneOf(
                                     [
-                                        A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+                                        A.GaussNoise(var_limit=(0.01, 0.05), p=0.5),
                                         A.GaussianBlur(
-                                            blur_limit=3, p=0.5, sigma_limit=(0.5, 3.0)
+                                            blur_limit=(3, 5),
+                                            p=0.5,
+                                            sigma_limit=(0.2, 0.5),
                                         ),
                                     ],
                                     p=0.5,
@@ -254,9 +259,13 @@ class GroupTransform:
             augmented = self.geom_transforms[modality](
                 image=img, target_mask=target_mask
             )
-            image_transformed = self.color_transforms[modality](
-                image=augmented["image"]
-            )["image"]
+            try:
+                image_transformed = self.color_transforms[modality](
+                    image=augmented["image"]
+                )["image"]
+            except cv.error:
+                rprint(modality, augmented["image"].shape, augmented["image"].dtype)
+                raise
 
             # Apply color transformation to the image only
             if modality == "hsi":
@@ -278,7 +287,9 @@ class GroupTransform:
                     ),
                 }
             else:
-                image_transformed = self.norm[modality](image=image_transformed)["image"]
+                image_transformed = self.norm[modality](image=image_transformed)[
+                    "image"
+                ]
                 data_aug[modality] = {
                     "image": image_transformed,
                     "target_mask": torch.from_numpy(augmented["target_mask"]).float(),
@@ -479,6 +490,7 @@ class ImageDataset(Dataset):
             "project_id": row["project"],
             "plate_id": row["plate"],
             "isolate_id": row["isolate"],
+            "index_in_df": self.df.index[idx],
         }
 
         return {"data": data_aug, "meta": meta, "label": row["label_clean_idx"]}
@@ -556,7 +568,11 @@ class ImageDataset(Dataset):
                 )
         if self.hsi_ceil is not None:
             # img = img / self.hsi_ceil
-            img = (img / np.quantile(img, 0.99)).clip(0, 1)
+            # starting from albumentations 1.4.10, GaussNoise forces float input to be
+            # float32 (otherwise opencv will throw error), which I don't really like or
+            # understand. I think this should be a # bug since other transforms don't
+            # have this constraint.
+            img = (img / np.quantile(img, 0.99)).clip(0, 1).astype(np.float32)
         return img
 
     @staticmethod
@@ -736,7 +752,9 @@ class TAMPICDataModule(L.LightningDataModule):
         _hsi_crop_size: int = 0,
         _hsi_norm: int = False,
         _stats_key: str = "0618_16s",
+        _k_per_sample: int = 60,
         _calc_stats_mode: bool = False,
+        _log: int = 1,
     ):
         """
         Initialize the data module with the given parameters.
@@ -813,7 +831,36 @@ class TAMPICDataModule(L.LightningDataModule):
         self._hsi_crop_size = _hsi_crop_size
         self._hsi_norm = _hsi_norm
         self._stats_key = _stats_key
+        self._k_per_sample = _k_per_sample
         self._calc_stats_mode = _calc_stats_mode
+        self._log = _log
+
+    @staticmethod
+    def _report_df_stats(df: pd.DataFrame) -> None:
+        num_isolates = len(df)
+        num_projects = len(df["project"].unique())
+        num_plates = len(df.groupby(["project", "plate"]))
+        num_media = df["medium_type"].nunique()
+        rprint(
+            f"Data loading completed. There are in total {num_isolates} isolates from "
+            f"{num_projects} projects, {num_plates} plates, and {num_media} medium types."
+        )
+
+    def _report_label_stats(self, df: pd.DataFrame) -> None:
+        # report how many isolates are fitted as what and how many are dropped
+        num_labels_raw = df["label"].nunique()
+        num_dropped = df.query("label in ['impure', 'ambiguous']").shape[0]
+        num_empty = df.query("label == 'empty'").shape[0]
+        rprint("Label fitting completed.")
+        rprint(f"\tThere are {num_labels_raw} unique labels.")
+        rprint(f"\t{num_dropped} are dropped for being 'impure' or 'ambiguous'.")
+        rprint(
+            f"\t{num_empty} 'empty' isolates are {'kept' if self.keep_empty else 'dropped'}.)"
+        )
+        rprint(
+            f"\t{len(self.label2idx) - len(self.label_clean2idx) + 1} labels are "
+            f"aggregated into 'others' and {'kept' if self.keep_others else 'dropped'}."
+        )
 
     def setup(self, stage: Optional[str] = None):
         """
@@ -827,13 +874,34 @@ class TAMPICDataModule(L.LightningDataModule):
             df_train_all = df_all.query("split == 'train'").copy()
             self._fit_labels(df_train_all)
             df_train_all = self._transform_labels(df_train_all)
-            self._calc_training_stats(df_train_all)
+            # self._calc_training_stats(df_train_all)
             self.df_train_all = self._add_weight(df_train_all)
 
             df_val_easy = df_all.query("split == 'val_easy'").copy()
             df_val_mid = df_all.query("split == 'val_mid'").copy()
             self.df_val_easy = self._transform_labels(df_val_easy)
             self.df_val_mid = self._transform_labels(df_val_mid)
+
+            if self._log:
+                self._report_df_stats(df_all)
+                self._report_label_stats(df_all)
+            _get_label_dist = lambda x: {
+                k: x["label_clean"].value_counts().to_dict().get(k, 0)
+                for k in self.label_clean2idx
+            }
+            label_dist_df = pd.DataFrame(
+                {
+                    "train": _get_label_dist(self.df_train_all),
+                    "val_easy": _get_label_dist(self.df_val_easy),
+                    "val_mid": _get_label_dist(self.df_val_mid),
+                },
+                index=self.label_clean2idx,
+            )
+            rprint(f"Final size of datasets:")
+            rprint(f"\tTrain: {len(self.df_train_all)}. ")
+            rprint(f"\tVal easy: {len(self.df_val_easy)}. ")
+            rprint(f"\tqVal mid: {len(self.df_val_mid)}. ")
+            rprint(tabulate(label_dist_df, tablefmt="outline"))
         else:
             raise NotImplementedError(f"Stage {stage} not supported.")
 
@@ -1172,21 +1240,7 @@ class TAMPICDataModule(L.LightningDataModule):
         return df
 
     def _calc_training_stats(self, df: pd.DataFrame) -> None:
-        num_batches_per_epoch_max = len(df) // (self.batch_size * self.num_devices)
-        if self.num_batches_per_epoch <= 0:
-            # set num batches per epoch as big as possible
-            self._num_batches_per_epoch = num_batches_per_epoch_max
-        else:
-            self._num_batches_per_epoch = self.num_batches_per_epoch
-        self.num_samples_per_epoch = (
-            self._num_batches_per_epoch * self.batch_size * self.num_devices
-        )
-        if self.num_samples_per_epoch > len(df):
-            rprint(
-                f"Epoch length ({self.num_samples_per_epoch}) exceeds the length of the DataFrame "
-                f"({len(df)}). Reset to the maximum possible value ({num_batches_per_epoch_max})."
-            )
-            self._num_batches_per_epoch = num_batches_per_epoch_max
+        pass
 
     def _sample_training_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1198,20 +1252,33 @@ class TAMPICDataModule(L.LightningDataModule):
         Returns:
             pd.DataFrame: Sampled DataFrame.
         """
-        sampled_df = df.sample(
-            n=self.num_samples_per_epoch,
-            replace=False,
-            weights=df["weight"],
-            random_state=self._rng,
+        self.num_samples_per_epoch = (
+            self.num_batches_per_epoch * self.batch_size * self.num_devices
         )
+        k = (
+            self.num_samples_per_epoch
+            if self._k_per_sample <= 0
+            else self._k_per_sample
+        )
+        k_max = len(df) // (self.batch_size * self.num_devices)
+        if k_max > len(df):
+            rprint(
+                f"Number of samples per sampling ({k_max}) exceeds the length of the DataFrame "
+                f"({len(df)}). Reset to the maximum possible value ({k_max})."
+            )
+            k = k_max
+        _t, _p = divmod(self.num_samples_per_epoch, k)
+        ks = [k] * _t + [_p] * (_p > 0)
+        idx = [self._rng.choice(len(df), size=k, replace=False) for k in ks]
+        sampled_df = df.iloc[np.concatenate(idx)].copy()
         # in pytorch ddp, samples are first split into devices and then to batches,
         # like [d1_b1, d1_b2, d1_b3, d2_b1, d2_b2, d2_b3, ...]
         sampled_df["batch_idx"] = np.tile(
-            np.repeat(np.arange(self._num_batches_per_epoch), self.batch_size),
+            np.repeat(np.arange(self.num_batches_per_epoch), self.batch_size),
             self.num_devices,
         )
         sampled_df["device_idx"] = np.repeat(
-            np.arange(self.num_devices), self.batch_size * self._num_batches_per_epoch
+            np.arange(self.num_devices), self.batch_size * self.num_batches_per_epoch
         )
         return sampled_df
 
@@ -1234,6 +1301,7 @@ class TAMPICDataModule(L.LightningDataModule):
             p_num_igs = self.p_num_igs_val
             p_igs = self.p_igs_val
         idx = df.index
+        # reset index here for simpler code when adding columns, will reset it back at the end.
         df = df.copy().reset_index(drop=True)
         # for idx_start in range(0, len(df), self.batch_size):
         for idx_start in range(len(df)):
