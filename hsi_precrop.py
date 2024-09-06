@@ -21,7 +21,7 @@ base_dir = "/home/ubuntu/data/camii"
 hsi_dir = "hyperspectral"
 hsi_plate_dec_dir = "hyperspectral_plate_detection"
 metadata_path = "all_0531.json"
-size = 196
+size = 512
 
 with open(f"{base_dir}/{metadata_path}") as f:
     metadata = json.load(f)

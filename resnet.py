@@ -65,6 +65,30 @@ class _TAMPICConv2d(nn.Conv2d):
         return super().forward(image)
 
 
+class _HSIAvg(nn.Module):
+    """This is a module without learnable parameters that averages the HSI data across 
+    channels given output size utilizing adaptive 1d pooling. It also takes 
+    corresponding average for the wavelengths.
+    """
+    def __init__(self, output_size: int):
+        super().__init__()
+        self.output_size = output_size
+        self.hsi_module = nn.AdaptiveAvgPool1d(output_size)
+        self.wavelength_module = nn.AdaptiveAvgPool1d(output_size)
+
+    def forward(self, hsi: torch.Tensor, wavelengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # hsi: [batch_size, num_channels, height, width]
+        # wavelengths: [batch_size, num_channels]
+        b, c, h, w = hsi.size()
+        hsi = hsi.permute(0, 2, 3, 1).view(b, h * w, c)
+        hsi = self.hsi_module(hsi)
+        hsi = hsi.view(b, h, w, self.output_size).permute(0, 3, 1, 2)
+        wavelengths = wavelengths.view(b, 1, c)
+        wavelengths = self.wavelength_module(wavelengths)
+        wavelengths = wavelengths.view(b, self.output_size)
+        return hsi, wavelengths
+
+
 class TAMPICResNet(ResNet):
     image_groups = ["rgb-red", "rgb-white", "hsi"]
 
@@ -77,11 +101,18 @@ class TAMPICResNet(ResNet):
         num_hsi_channels: int = 462,
         _pretrained_hsi_base: bool = None,
         _norm_and_sum: bool = True,  # batch norm and sum
+        _hsi_avg_dim: int | None = None,
     ):
         super(TAMPICResNet, self).__init__(block, layers, num_classes)
         self._pretrained_hsi_base = _pretrained_hsi_base
         self._norm_and_sum = _norm_and_sum
         self.new_param_name_prefixs = set()
+
+        if _hsi_avg_dim is not None:
+            self.conv0_hsi = _HSIAvg(_hsi_avg_dim)
+            num_hsi_channels = _hsi_avg_dim
+        else:
+            self.conv0_hsi = lambda hsi, wavelengths: (hsi, wavelengths)
 
         self.conv1_hsi = AdaptiveConvBlock(
             1, 64, kernel_size=(7, 7), stride=2, padding=3, bias=False
@@ -249,6 +280,9 @@ class TAMPICResNet(ResNet):
         data: dict,
         wavelengths: torch.Tensor,
     ) -> torch.Tensor:
+        if "hsi" in data:
+            hsi, wavelengths = self.conv0_hsi(data["hsi"]["image"], wavelengths)
+            data["hsi"]["image"] = hsi
         return self.fc(
             self.avgpool(
                 self._forward_stem(self._forward_base(data, wavelengths))
@@ -262,6 +296,7 @@ def resnet18_tampic(
     num_wavelengths: int = 462,
     _pretrained_hsi_base=False,
     _norm_and_sum=True,
+    _hsi_avg_dim: int | None = None,
     _reuse_head: bool = False,
 ):
     # if pretrained:
@@ -289,6 +324,7 @@ def resnet18_tampic(
         num_hsi_channels=num_wavelengths,
         _pretrained_hsi_base=_pretrained_hsi_base,
         _norm_and_sum=_norm_and_sum,
+        _hsi_avg_dim=_hsi_avg_dim,
     )
     return model
 
@@ -299,6 +335,7 @@ def resnet34_tampic(
     num_wavelengths: int = 462,
     _pretrained_hsi_base=False,
     _norm_and_sum=True,
+    _hsi_avg_dim: int | None = None,
 ):
     if pretrained:
         _model = torch.hub.load("pytorch/vision", "resnet34", weights="IMAGENET1K_V1")
@@ -315,6 +352,7 @@ def resnet34_tampic(
         num_hsi_channels=num_wavelengths,
         _pretrained_hsi_base=_pretrained_hsi_base,
         _norm_and_sum=_norm_and_sum,
+        _hsi_avg_dim=_hsi_avg_dim,
     )
 
     return model
@@ -326,6 +364,7 @@ def resnet50_tampic(
     num_wavelengths: int = 462,
     _pretrained_hsi_base=False,
     _norm_and_sum=True,
+    _hsi_avg_dim: int | None = None,
 ):
     if pretrained:
         _model = torch.hub.load("pytorch/vision", "resnet50", weights="IMAGENET1K_V2")
@@ -342,6 +381,7 @@ def resnet50_tampic(
         num_hsi_channels=num_wavelengths,
         _pretrained_hsi_base=_pretrained_hsi_base,
         _norm_and_sum=_norm_and_sum,
+        _hsi_avg_dim=_hsi_avg_dim,
     )
 
     return model
@@ -413,6 +453,12 @@ if __name__ == "__main__":
     _ = model.get_param_groups()
     print(output.size())
 
+    # pretrained with hsi avg
+    model = resnet18_tampic(num_classes=30, pretrained=True, _hsi_avg_dim=8)
+    output = model(data["data"], wavelengths)
+    _ = model.get_param_groups()
+    print(output.size())
+
     # test with an image
     model = resnet18_tampic(num_classes=1000, pretrained=True, _reuse_head=True)
     model.eval()
@@ -442,7 +488,7 @@ if __name__ == "__main__":
     print(f"{category_name}: {100 * score:.1f}%")
 
     # the following is from torchvision docs. Given our model arch, the score should be
-    # the same when inferencing with pretrained weights (41.3%).
+    # the same when using pretrained weights (41.3%).
     # Step 1: Initialize model with the best available weights
     weights = ResNet18_Weights.DEFAULT
     model = torch.hub.load("pytorch/vision", "resnet18", weights="IMAGENET1K_V1")

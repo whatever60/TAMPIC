@@ -73,8 +73,8 @@ class TAMPICResNetLightningModule(L.LightningModule):
             }
         )
         self.metrics_acc_train = metrics_acc.clone(prefix="train_")
-        self.metrics_acc_val_easy = metrics_acc.clone(prefix="val-easy")
-        self.metrics_acc_val_mid = metrics_acc.clone(prefix="val-mid")
+        self.metrics_acc_val_easy = metrics_acc.clone(prefix="val-easy_")
+        self.metrics_acc_val_mid = metrics_acc.clone(prefix="val-mid_")
         self.metric_cm_val_easy = MulticlassConfusionMatrix(num_classes=num_classes)
         self.metric_cm_val_mid = MulticlassConfusionMatrix(num_classes=num_classes)
 
@@ -119,9 +119,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
     def training_step(self, batch, batch_idx):
         data = batch["data"]
         label = batch["label"]
-        print("----------")
         logits = self(data, self.wavelengths.to(self.device))
-        print("++++++++++")
         loss = F.cross_entropy(logits, label)
         self.metrics_acc_train.update(logits, label)
         self.log_dict(
@@ -168,12 +166,15 @@ class TAMPICResNetLightningModule(L.LightningModule):
     def _save_prediction_on_epoch_end(self, dataset: str) -> None:
         if dataset == "train":
             logger_prediction = self.logger_prediction_train
+            data_df = self.trainer.train_dataloader.dataset.df.copy()
             prefix = "train"
         elif dataset == "val-easy":
             logger_prediction = self.logger_prediction_val_easy
+            data_df = self.trainer.val_dataloaders[0].dataset.df.copy()
             prefix = "val-easy"
         elif dataset == "val-mid":
             logger_prediction = self.logger_prediction_val_mid
+            data_df = self.trainer.val_dataloaders[1].dataset.df.copy()
             prefix = "val-mid"
         else:
             raise ValueError(f"Invalid dataset: {dataset}")
@@ -184,28 +185,44 @@ class TAMPICResNetLightningModule(L.LightningModule):
             columns = [idx2label_clean[i] for i in range(len(idx2label_clean))]
         except AttributeError:
             columns = np.arange(logits.shape[1])
-        indexs = logger_prediction["index_in_df"].compute().cpu().numpy()
+        indexs = logger_prediction["index_in_df"].compute().cpu().numpy().astype(int)
         logits_df = pd.DataFrame(logits, columns=columns, index=indexs)
         other_info_df = pd.DataFrame(
             {
-                "epoch": logger_prediction["epoch"].compute(),
-                "label": logger_prediction["label"].compute(),
+                "epoch": logger_prediction["epoch"].compute().numpy().astype(int),
+                "batch_idx": logger_prediction["batch_idx"].compute().numpy().astype(int),
+                "device": logger_prediction["device"].compute().numpy().astype(int),
+                "label": logger_prediction["label"].compute().numpy().astype(int),
                 # "project_id": logger_prediction["project_id"].compute(),
                 # "plate_id": logger_prediction["plate_id"].compute(),
                 # "sample_id": logger_prediction["sample_id"].compute(),
             },
             index=indexs,
         )
-        logits_df.to_csv(
-            f"{self._prediction_log_dir}/{prefix}_logits_epoch_{self.current_epoch}.csv"
+        logits_df.to_parquet(
+            f"{self._prediction_log_dir}/{prefix}_epoch-{self.current_epoch}_logits.parquet"
         )
         other_info_df.to_csv(
-            f"{self._prediction_log_dir}/{prefix}_info_epoch_{self.current_epoch}.csv"
+            f"{self._prediction_log_dir}/{prefix}_epoch-{self.current_epoch}_info.csv"
+        )
+        data_df.to_csv(
+            f"{self._prediction_log_dir}/{prefix}_epoch-{self.current_epoch}_df.csv"
         )
         for m in logger_prediction.values():
             m.reset()
 
-    def on_training_epoch_end(self) -> None:
+    def on_train_start(self) -> None:
+        """Save dataset df datasets for all training and validation datasets.
+        """
+        df_train = self.trainer.datamodule.df_train_all.copy()
+        df_val_easy = self.trainer.datamodule.df_val_easy.copy()
+        df_val_mid = self.trainer.datamodule.df_val_mid.copy()
+        # put _ at the start of file name so that they are at the top of the folder
+        df_train.to_csv(f"{self._prediction_log_dir}/_train_all.csv")
+        df_val_easy.to_csv(f"{self._prediction_log_dir}/_val-easy.csv")
+        df_val_mid.to_csv(f"{self._prediction_log_dir}/_val-mid.csv")
+
+    def on_train_epoch_end(self) -> None:
         self._save_prediction_on_epoch_end("train")
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):

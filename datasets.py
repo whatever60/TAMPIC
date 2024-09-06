@@ -8,6 +8,7 @@ from scipy.stats import multivariate_normal
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 from torchvision import transforms as T
 import lightning as L
 import albumentations as A
@@ -263,9 +264,9 @@ class GroupTransform:
                 image_transformed = self.color_transforms[modality](
                     image=augmented["image"]
                 )["image"]
-            except cv.error:
+            except cv.error as e:
                 rprint(modality, augmented["image"].shape, augmented["image"].dtype)
-                raise
+                raise e
 
             # Apply color transformation to the image only
             if modality == "hsi":
@@ -298,6 +299,30 @@ class GroupTransform:
         return data_aug
 
 
+
+# def adaptive_avg_pool(data: np.ndarray, output_size: int) -> np.ndarray:
+#     """Take average on the second dimension (channel) of data utilizing pytorch adaptive pooling.
+#     """
+#     ndim = data.ndim
+#     b, c, *s = data.shape
+#     data = torch.from_numpy(data)
+#     data = data.permute(0, *list(range(2, ndim)), 1).view(b, int(np.prod(s)), c)
+#     data = F.adaptive_avg_pool1d(data, output_size)
+#     data = data.view(b, *s, output_size).permute(0, ndim - 1, *list(range(1, ndim - 1)))
+#     return data.numpy()
+
+
+def adaptive_avg_pool(data: np.ndarray, output_size: int) -> np.ndarray:
+    """Take average on the last dimension of data utilizing pytorch adaptive pooling.
+    """
+    b, *s, c = data.shape
+    data = torch.from_numpy(data)
+    data = data.view(b, int(np.prod(s)), c)
+    data = F.adaptive_avg_pool1d(data, output_size)
+    data = data.view(b, *s, output_size)
+    return data.numpy()
+
+
 class ImageDataset(Dataset):
     image_groups = ["rgb-red", "rgb-white", "hsi"]
 
@@ -317,6 +342,7 @@ class ImageDataset(Dataset):
         _hsi_crop_size: int = 0,
         _hsi_coord_digits: int = 3,
         _calc_stats_mode: bool = False,
+        _hsi_avg_dim: int | None = None,
     ):
         """
         Initialize the dataset with the given parameters.
@@ -341,7 +367,10 @@ class ImageDataset(Dataset):
         self._hsi_group_k = _hsi_group_k
         self._hsi_crop_size = _hsi_crop_size
         self._hsi_coord_digits = _hsi_coord_digits
-        if _hsi_group_k > 0 and _hsi_crop_size > 0:
+        self._hsi_avg_dim = _hsi_avg_dim
+
+        # some sanity checks
+        if self._hsi_group_k > 0 and self._hsi_crop_size > 0:
             raise ValueError("Cannot specify both _hsi_group_k and _hsi_crop_size.")
 
         self.transform = GroupTransform(
@@ -516,9 +545,10 @@ class ImageDataset(Dataset):
                 + str(self._hsi_crop_size)
                 + ".npz"
             )
-            img = np.load(os.path.join(hsi_path, file_name))["data"][
-                ..., hsi_channel_dropout
-            ]
+            img = np.load(os.path.join(hsi_path, file_name))["data"]
+            if self._hsi_avg_dim:
+                img = adaptive_avg_pool(img, self._hsi_avg_dim)
+            img = img[..., hsi_channel_dropout]
 
         elif self._hsi_group_k > 0:
             # hsi is stored as channel-grouped 16bit tif, for example 3 channels per
@@ -570,7 +600,7 @@ class ImageDataset(Dataset):
             # img = img / self.hsi_ceil
             # starting from albumentations 1.4.10, GaussNoise forces float input to be
             # float32 (otherwise opencv will throw error), which I don't really like or
-            # understand. I think this should be a # bug since other transforms don't
+            # understand. I think this should be a bug since other transforms don't
             # have this constraint.
             img = (img / np.quantile(img, 0.99)).clip(0, 1).astype(np.float32)
         return img
@@ -601,8 +631,8 @@ class ImageDataset(Dataset):
 def gaussian_image(
     positions: np.ndarray | tuple[float, float],
     fwhm: float,
-    shape: np.ndarray = None,
-    pois: np.ndarray = None,
+    shape: np.ndarray | None = None,
+    pois: np.ndarray | None = None,
     trunc: float = 1e-5,
     normalize: bool = True,
 ) -> np.ndarray:
@@ -748,6 +778,7 @@ class TAMPICDataModule(L.LightningDataModule):
         num_workers: int,
         num_batches_per_epoch: Optional[int] = None,
         #
+        _hsi_avg_dim: int | None = None,
         _hsi_group_k: int = 0,
         _hsi_crop_size: int = 0,
         _hsi_norm: int = False,
@@ -827,6 +858,7 @@ class TAMPICDataModule(L.LightningDataModule):
         self.num_workers = num_workers
 
         # others
+        self._hsi_avg_dim = _hsi_avg_dim
         self._hsi_group_k = _hsi_group_k
         self._hsi_crop_size = _hsi_crop_size
         self._hsi_norm = _hsi_norm
@@ -926,6 +958,7 @@ class TAMPICDataModule(L.LightningDataModule):
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
             _calc_stats_mode=self._calc_stats_mode,
+            _hsi_avg_dim=self._hsi_avg_dim,
         )
 
         return DataLoader(
@@ -954,6 +987,7 @@ class TAMPICDataModule(L.LightningDataModule):
             split="val",
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
+            _hsi_avg_dim=self._hsi_avg_dim,
         )
 
         df_val_mid = self._set_randomness(self.df_val_mid, split="val")
@@ -968,6 +1002,7 @@ class TAMPICDataModule(L.LightningDataModule):
             split="val",
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
+            _hsi_avg_dim=self._hsi_avg_dim,
         )
 
         return [
@@ -1009,6 +1044,9 @@ class TAMPICDataModule(L.LightningDataModule):
         self.hsi_wavelengths = np.loadtxt(
             os.path.join(metadata_dir, global_properties["hsi_wavelengths"])
         )
+        if self._hsi_avg_dim is not None:
+            self.hsi_wavelengths = adaptive_avg_pool(self.hsi_wavelengths, self._hsi_avg_dim)
+            self.num_hsi_channels = self.hsi_wavelengths.shape[0]
         self._hsi_ceil = global_properties["hsi_ceil"]
         self.hsi_ceil = self._hsi_ceil if self._hsi_norm else None
         self.taxon_levels = np.array(global_properties["taxonomy_levels"])
@@ -1488,8 +1526,7 @@ if __name__ == "__main__":
     if args.command == "test":
         base_dir = "/mnt/c/aws_data/data/camii"
         base_dir = "/home/ubuntu/data/camii"
-        # for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
-        for amplicon_type, taxon_level in zip(["its"], ["species"]):
+        for amplicon_type, taxon_level in zip(["16s", "its"], ["genus", "species"]):
             t0 = time.perf_counter()
             dm = TAMPICDataModule(
                 metadata_train_path=f"{base_dir}/all_0531.json",
