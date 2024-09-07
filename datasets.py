@@ -315,12 +315,13 @@ class GroupTransform:
 def adaptive_avg_pool(data: np.ndarray, output_size: int) -> np.ndarray:
     """Take average on the last dimension of data utilizing pytorch adaptive pooling.
     """
-    b, *s, c = data.shape
-    data = torch.from_numpy(data)
-    data = data.view(b, int(np.prod(s)), c)
+    dtype = data.dtype
+    *s, c = data.shape
+    data = torch.from_numpy(data).float()
+    data = data.view(int(np.prod(s)), c)
     data = F.adaptive_avg_pool1d(data, output_size)
-    data = data.view(b, *s, output_size)
-    return data.numpy()
+    data = data.view(*s, output_size)
+    return data.numpy().astype(dtype)
 
 
 class ImageDataset(Dataset):
@@ -887,7 +888,7 @@ class TAMPICDataModule(L.LightningDataModule):
         rprint(f"\tThere are {num_labels_raw} unique labels.")
         rprint(f"\t{num_dropped} are dropped for being 'impure' or 'ambiguous'.")
         rprint(
-            f"\t{num_empty} 'empty' isolates are {'kept' if self.keep_empty else 'dropped'}.)"
+            f"\t{num_empty} 'empty' isolates are {'kept' if self.keep_empty else 'dropped'}."
         )
         rprint(
             f"\t{len(self.label2idx) - len(self.label_clean2idx) + 1} labels are "
@@ -932,7 +933,7 @@ class TAMPICDataModule(L.LightningDataModule):
             rprint(f"Final size of datasets:")
             rprint(f"\tTrain: {len(self.df_train_all)}. ")
             rprint(f"\tVal easy: {len(self.df_val_easy)}. ")
-            rprint(f"\tqVal mid: {len(self.df_val_mid)}. ")
+            rprint(f"\tVal mid: {len(self.df_val_mid)}. ")
             rprint(tabulate(label_dist_df, tablefmt="outline"))
         else:
             raise NotImplementedError(f"Stage {stage} not supported.")
@@ -1044,14 +1045,20 @@ class TAMPICDataModule(L.LightningDataModule):
         self.hsi_wavelengths = np.loadtxt(
             os.path.join(metadata_dir, global_properties["hsi_wavelengths"])
         )
-        if self._hsi_avg_dim is not None:
-            self.hsi_wavelengths = adaptive_avg_pool(self.hsi_wavelengths, self._hsi_avg_dim)
-            self.num_hsi_channels = self.hsi_wavelengths.shape[0]
         self._hsi_ceil = global_properties["hsi_ceil"]
         self.hsi_ceil = self._hsi_ceil if self._hsi_norm else None
         self.taxon_levels = np.array(global_properties["taxonomy_levels"])
         self.taxon_level_idx = np.where(self.taxon_levels == self.taxon_level)[0][0]
         self.stats = global_properties["stats"][self._stats_key]  # for normalization
+        if self._hsi_avg_dim is not None:
+            self.hsi_wavelengths = adaptive_avg_pool(self.hsi_wavelengths, self._hsi_avg_dim)
+            self.num_hsi_channels = self.hsi_wavelengths.shape[0]
+            self.stats["hsi"]["mean"] = adaptive_avg_pool(
+                np.array(self.stats["hsi"]["mean"]), self._hsi_avg_dim
+            ).tolist()
+            self.stats["hsi"]["std"] = adaptive_avg_pool(
+                np.array(self.stats["hsi"]["std"]), self._hsi_avg_dim
+            ).tolist()
 
         # load information of each isolate (project id, plate id isolate id, available
         # modalities, available time point for each modality, path to all of the images
@@ -1552,11 +1559,12 @@ if __name__ == "__main__":
                 target_mask_kernel_size=5,
                 num_devices=2,
                 batch_size=8,
-                num_workers=0,
+                num_workers=16,
                 num_batches_per_epoch=50,
                 # _hsi_group_k=3,
                 _hsi_crop_size=196,
                 _hsi_norm=True,
+                _hsi_avg_dim=100,
             )
             dm.setup()
             dl_train = dm.val_dataloader()[0]
