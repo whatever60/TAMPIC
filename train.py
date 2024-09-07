@@ -288,6 +288,7 @@ dm = TAMPICDataModule(
     # _hsi_group_k=3,
     _hsi_crop_size=196,
     _hsi_norm=True,
+    _hsi_avg_dim=train_config_mode.get("_hsi_avg_dim", None),
 )
 dm.setup()
 
