@@ -2,9 +2,10 @@ import json
 import os
 import warnings
 from typing import Optional
+from functools import lru_cache
 
 import numpy as np
-from scipy.stats import multivariate_normal
+from scipy.spatial import KDTree
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -322,6 +323,32 @@ def adaptive_avg_pool(data: np.ndarray, output_size: int) -> np.ndarray:
     return data.numpy().astype(dtype)
 
 
+@lru_cache(maxsize=None)  # Cache indefinitely based on hsi_path
+def get_kdtree(hsi_path: str) -> tuple[KDTree, list[str], list[tuple[float, float]]]:
+    """Build and cache the KDTree for a given hsi_path."""
+    coord_files = []
+    coord_list = []
+
+    # Find all coordinate files in the directory
+    for file in os.listdir(hsi_path):
+        if file.endswith(".npz"):
+            try:
+                # Extract the coordinates from the file name
+                coord_x, coord_y, _ = file.split('_')
+                coord_x, coord_y = float(coord_x), float(coord_y)
+                coord_files.append(file)
+                coord_list.append((coord_x, coord_y))
+            except ValueError:
+                continue  # Skip files that do not match the expected format
+
+    if not coord_list:
+        raise ValueError("No valid coordinate files found in the directory.")
+
+    # Build KDTree and return it along with the coordinate files
+    tree = KDTree(coord_list)
+    return tree, coord_files, coord_list
+
+
 class ImageDataset(Dataset):
     image_groups = ["rgb-red", "rgb-white", "hsi"]
 
@@ -534,20 +561,25 @@ class ImageDataset(Dataset):
             os.path.join(hsi_path, x), cv.IMREAD_UNCHANGED
         )
         if self._hsi_crop_size > 0:
-            # hsi is pre cropped.
-            format_str = "{{:.{}f}}".format(self._hsi_coord_digits)
-            file_name = (
-                format_str.format(hsi_coord[0])
-                + "_"
-                + format_str.format(hsi_coord[1])
-                + "_"
-                + str(self._hsi_crop_size)
-                + ".npz"
-            )
+            tree, coord_files, coord_list = get_kdtree(hsi_path)
+            dist, index = tree.query(hsi_coord)
+
+            # Assert the nearest distance is less than 0.1
+            if dist >= 0.1:
+                nearest_coord = coord_list[index]
+                raise ValueError(
+                    f"Nearest coordinate {nearest_coord} found with distance {dist:.4f} "
+                    f"to expected coordinate {hsi_coord}. Distance must be < 0.1."
+                )
+            
+            # Use the nearest neighbor's file name
+            file_name = coord_files[index]
             img = np.load(os.path.join(hsi_path, file_name))["data"]
-            if self._hsi_avg_dim:
-                img = adaptive_avg_pool(img, self._hsi_avg_dim)
-            img = img[..., hsi_channel_dropout]
+
+            if self._hsi_crop_size > 0:
+                if self._hsi_avg_dim:
+                    img = adaptive_avg_pool(img, self._hsi_avg_dim)
+                img = img[..., hsi_channel_dropout]
 
         elif self._hsi_group_k > 0:
             # hsi is stored as channel-grouped 16bit tif, for example 3 channels per
