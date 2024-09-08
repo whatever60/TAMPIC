@@ -299,7 +299,6 @@ class GroupTransform:
         return data_aug
 
 
-
 # def adaptive_avg_pool(data: np.ndarray, output_size: int) -> np.ndarray:
 #     """Take average on the second dimension (channel) of data utilizing pytorch adaptive pooling.
 #     """
@@ -313,8 +312,7 @@ class GroupTransform:
 
 
 def adaptive_avg_pool(data: np.ndarray, output_size: int) -> np.ndarray:
-    """Take average on the last dimension of data utilizing pytorch adaptive pooling.
-    """
+    """Take average on the last dimension of data utilizing pytorch adaptive pooling."""
     dtype = data.dtype
     *s, c = data.shape
     data = torch.from_numpy(data).float()
@@ -1051,14 +1049,19 @@ class TAMPICDataModule(L.LightningDataModule):
         self.taxon_level_idx = np.where(self.taxon_levels == self.taxon_level)[0][0]
         self.stats = global_properties["stats"][self._stats_key]  # for normalization
         if self._hsi_avg_dim is not None:
-            self.hsi_wavelengths = adaptive_avg_pool(self.hsi_wavelengths, self._hsi_avg_dim)
-            self.num_hsi_channels = self.hsi_wavelengths.shape[0]
-            self.stats["hsi"]["mean"] = adaptive_avg_pool(
-                np.array(self.stats["hsi"]["mean"]), self._hsi_avg_dim
-            ).tolist()
-            self.stats["hsi"]["std"] = adaptive_avg_pool(
-                np.array(self.stats["hsi"]["std"]), self._hsi_avg_dim
-            ).tolist()
+            if self._hsi_avg_dim >= len(self.hsi_wavelengths):
+                self._hsi_avg_dim = None
+            else:
+                self.hsi_wavelengths = adaptive_avg_pool(
+                    self.hsi_wavelengths, self._hsi_avg_dim
+                )
+                self.num_hsi_channels = self.hsi_wavelengths.shape[0]
+                self.stats["hsi"]["mean"] = adaptive_avg_pool(
+                    np.array(self.stats["hsi"]["mean"]), self._hsi_avg_dim
+                ).tolist()
+                self.stats["hsi"]["std"] = adaptive_avg_pool(
+                    np.array(self.stats["hsi"]["std"]), self._hsi_avg_dim
+                ).tolist()
 
         # load information of each isolate (project id, plate id isolate id, available
         # modalities, available time point for each modality, path to all of the images
