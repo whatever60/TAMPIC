@@ -189,10 +189,10 @@ class TAMPICResNetLightningModule(L.LightningModule):
         logits_df = pd.DataFrame(logits, columns=columns, index=indexs)
         other_info_df = pd.DataFrame(
             {
-                "epoch": logger_prediction["epoch"].compute().numpy().astype(int),
-                "batch_idx": logger_prediction["batch_idx"].compute().numpy().astype(int),
-                "device": logger_prediction["device"].compute().numpy().astype(int),
-                "label": logger_prediction["label"].compute().numpy().astype(int),
+                "epoch": logger_prediction["epoch"].compute().cpu().numpy().astype(int),
+                "batch_idx": logger_prediction["batch_idx"].compute().cpu().numpy().astype(int),
+                "device": logger_prediction["device"].compute().cpu().numpy().astype(int),
+                "label": logger_prediction["label"].compute().cpu().numpy().astype(int),
                 # "project_id": logger_prediction["project_id"].compute(),
                 # "plate_id": logger_prediction["plate_id"].compute(),
                 # "sample_id": logger_prediction["sample_id"].compute(),
