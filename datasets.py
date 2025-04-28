@@ -48,6 +48,82 @@ class _HSINormalize(A.Normalize):
         return {"image": img}
 
 
+def get_geom_transforms(
+    crop_size_rgb_white: int,
+    crop_size_rgb_red: int,
+    crop_size_hsi: int,
+    couple: bool = False,
+) -> dict:
+    if not couple:
+        geom_transforms = {
+            "rgb-red": A.Compose(
+                [
+                    A.RandomResizedCrop(
+                        size=(crop_size_rgb_red, crop_size_rgb_red), scale=(0.4, 1)
+                    ),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.5),
+                    A.Rotate(limit=20, p=0.5),
+                ],
+                additional_targets={"target_mask": "image"},
+            ),
+            "rgb-white": A.Compose(
+                [
+                    A.RandomResizedCrop(
+                        size=(crop_size_rgb_white, crop_size_rgb_white), scale=(0.4, 1)
+                    ),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.5),
+                    A.Rotate(limit=20, p=0.5),
+                ],
+                additional_targets={"target_mask": "image"},
+            ),
+            "hsi": A.Compose(
+                [
+                    A.RandomResizedCrop(
+                        size=(crop_size_hsi, crop_size_hsi), scale=(0.4, 1)
+                    ),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.5),
+                    A.Rotate(limit=20, p=0.5),
+                ],
+                additional_targets={"target_mask": "image"},
+            ),
+        }
+    else:
+        assert crop_size_rgb_white == crop_size_rgb_red, "Crop size must be the same."
+        geom_transforms = {
+            "rgb": A.Compose(
+                [
+                    A.RandomResizedCrop(
+                        size=(crop_size_rgb_white, crop_size_rgb_white), scale=(0.4, 1)
+                    ),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.5),
+                    A.Rotate(limit=20, p=0.5),
+                ],
+                additional_targets={
+                    "target_mask": "image",
+                    "rgb_2": "image",
+                    "target_mask_2": "image",
+                },
+            ),
+            "hsi": A.Compose(
+                [
+                    A.RandomResizedCrop(
+                        size=(crop_size_hsi, crop_size_hsi), scale=(0.4, 1)
+                    ),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.5),
+                    A.Rotate(limit=20, p=0.5),
+                ],
+                additional_targets={"target_mask": "image"},
+            ),
+        }
+
+    return geom_transforms
+
+
 class GroupTransform:
     def __init__(
         self,
@@ -56,7 +132,10 @@ class GroupTransform:
         split: str = "train",
         _calc_stats_mode: bool = False,
         _no_norm: bool = False,
+        _couple_rgb: bool = False,
     ):
+        self._couple_rgb = _couple_rgb
+
         if isinstance(crop_size, int):
             crop_size = {"rgb-red": crop_size, "rgb-white": crop_size, "hsi": crop_size}
         self.crop_size = crop_size
@@ -67,47 +146,12 @@ class GroupTransform:
 
         if not _calc_stats_mode:
             # Geometric transformations applied per modality
-            self.geom_transforms = {
-                "rgb-red": A.Compose(
-                    [
-                        A.RandomResizedCrop(
-                            width=crop_size["rgb-red"],
-                            height=crop_size["rgb-red"],
-                            scale=(0.4, 1),
-                        ),
-                        A.HorizontalFlip(p=0.5),
-                        A.VerticalFlip(p=0.5),
-                        A.Rotate(limit=20, p=0.5),
-                    ],
-                    additional_targets={"target_mask": "image"},
-                ),
-                "rgb-white": A.Compose(
-                    [
-                        A.RandomResizedCrop(
-                            width=crop_size["rgb-white"],
-                            height=crop_size["rgb-white"],
-                            scale=(0.4, 1),
-                        ),
-                        A.HorizontalFlip(p=0.5),
-                        A.VerticalFlip(p=0.5),
-                        A.Rotate(limit=20, p=0.5),
-                    ],
-                    additional_targets={"target_mask": "image"},
-                ),
-                "hsi": A.Compose(
-                    [
-                        A.RandomResizedCrop(
-                            width=crop_size["hsi"],
-                            height=crop_size["hsi"],
-                            scale=(0.4, 1),
-                        ),
-                        A.HorizontalFlip(p=0.5),
-                        A.VerticalFlip(p=0.5),
-                        A.Rotate(limit=20, p=0.5),
-                    ],
-                    additional_targets={"target_mask": "image"},
-                ),
-            }
+            self.geom_transforms = get_geom_transforms(
+                crop_size_rgb_white=crop_size["rgb-white"],
+                crop_size_rgb_red=crop_size["rgb-red"],
+                crop_size_hsi=crop_size["hsi"],
+                couple=_couple_rgb,
+            )
 
             # Color transformations are specific to each modality
             if split == "train":
@@ -240,7 +284,7 @@ class GroupTransform:
         # images: dict[str, np.ndarray],
         # target_masks: dict[str, np.ndarray],
         data: dict[str, np.ndarray],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    ) -> dict[str, dict]:
         """
         Apply geometric and color transformations to the images.
 
@@ -255,38 +299,43 @@ class GroupTransform:
         # transformed_target_masks = {}
         data_aug = {}
 
-        for modality, data_m in data.items():
-            img = data_m["image"]
-            target_mask = data_m["target_mask"]
-            augmented = self.geom_transforms[modality](
-                image=img, target_mask=target_mask
-            )
+        data_augmented = (
+            self._geom_transforms_call_coupled(data)
+            if self._couple_rgb
+            else self._geom_transforms_call(data)
+        )
+        for modality, data_m_augmented in data_augmented.items():
             try:
                 image_transformed = self.color_transforms[modality](
-                    image=augmented["image"]
+                    image=data_m_augmented["image"]
                 )["image"]
             except cv.error as e:
-                rprint(modality, augmented["image"].shape, augmented["image"].dtype)
+                rprint(
+                    modality,
+                    data_m_augmented["image"].shape,
+                    data_m_augmented["image"].dtype,
+                )
                 raise e
 
             # Apply color transformation to the image only
             if modality == "hsi":
+                hsi_channel_dropout = data[modality]["hsi_channel_dropout"]
                 image_transformed = self.norm[modality](
                     image=image_transformed,
-                    hsi_channel_dropout=data_m["hsi_channel_dropout"],
+                    hsi_channel_dropout=hsi_channel_dropout,
                 )["image"]
                 image_full = torch.zeros(
-                    (len(data_m["hsi_channel_dropout"]), *image_transformed.shape[1:]),
+                    (len(hsi_channel_dropout), *image_transformed.shape[1:]),
                     dtype=image_transformed.dtype,
                     device=image_transformed.device,
                 )
-                image_full[data_m["hsi_channel_dropout"]] += image_transformed
+                image_full[hsi_channel_dropout] += image_transformed
                 data_aug[modality] = {
                     "image": image_full,
-                    "target_mask": torch.from_numpy(augmented["target_mask"]).float(),
-                    "hsi_channel_dropout": torch.from_numpy(
-                        data_m["hsi_channel_dropout"]
-                    ),
+                    "target_mask": torch.from_numpy(
+                        data_m_augmented["target_mask"]
+                    ).float(),
+                    "hsi_channel_dropout": torch.from_numpy(hsi_channel_dropout),
                 }
             else:
                 image_transformed = self.norm[modality](image=image_transformed)[
@@ -294,10 +343,72 @@ class GroupTransform:
                 ]
                 data_aug[modality] = {
                     "image": image_transformed,
-                    "target_mask": torch.from_numpy(augmented["target_mask"]).float(),
+                    "target_mask": torch.from_numpy(
+                        data_m_augmented["target_mask"]
+                    ).float(),
                 }
 
         return data_aug
+
+    def _geom_transforms_call_coupled(
+        self, data: dict[str, np.ndarray]
+    ) -> dict[str, dict[str, np.ndarray]]:
+        """When rgb modalities are coupled:
+        If both rgb modalities are given in data, pass them to the same transform.
+        If only one rgb modality is give, pass it to the transform.
+        """
+        num_rgb_modalities = sum(
+            1 for modality in ["rgb-red", "rgb-white"] if modality in data
+        )
+        if num_rgb_modalities == 2:
+            augmented_rgb = self.geom_transforms["rgb"](
+                image=data["rgb-red"]["image"],
+                target_mask=data["rgb-red"]["target_mask"],
+                rgb_2=data["rgb-white"]["image"],
+                target_mask_2=data["rgb-white"]["target_mask"],
+            )
+            ret = {
+                "rgb-red": {
+                    "image": augmented_rgb["image"],
+                    "target_mask": augmented_rgb["target_mask"],
+                },
+                "rgb-white": {
+                    "image": augmented_rgb["rgb_2"],
+                    "target_mask": augmented_rgb["target_mask_2"],
+                },
+            }
+            if "hsi" in data:
+                augmented_hsi = self.geom_transforms["hsi"](
+                    image=data["hsi"]["image"], target_mask=data["hsi"]["target_mask"]
+                )
+                ret["hsi"] = {
+                    "image": augmented_hsi["image"],
+                    "target_mask": augmented_hsi["target_mask"],
+                }
+        else:
+            ret = {}
+            for modality, data_m in data.items():
+                img = data_m["image"]
+                target_mask = data_m["target_mask"]
+                ret[modality] = self.geom_transforms[modality.split("-")[0]](
+                    image=img, target_mask=target_mask
+                )
+        return ret
+
+    def _geom_transforms_call(
+        self, data: dict[str, np.ndarray]
+    ) -> dict[str, dict[str, np.ndarray]]:
+        """When rgb modalities are not coupled:
+        Pass each modality to the corresponding transform.
+        """
+        ret = {}
+        for modality, data_m in data.items():
+            img = data_m["image"]
+            target_mask = data_m["target_mask"]
+            ret[modality] = self.geom_transforms[modality](
+                image=img, target_mask=target_mask
+            )
+        return ret
 
 
 # def adaptive_avg_pool(data: np.ndarray, output_size: int) -> np.ndarray:
@@ -316,11 +427,19 @@ def adaptive_avg_pool(data: np.ndarray, output_size: int) -> np.ndarray:
     """Take average on the last dimension of data utilizing pytorch adaptive pooling."""
     dtype = data.dtype
     *s, c = data.shape
-    data = torch.from_numpy(data).float()
-    data = data.view(int(np.prod(s)), c)
-    data = F.adaptive_avg_pool1d(data, output_size)
-    data = data.view(*s, output_size)
-    return data.numpy().astype(dtype)
+    # data = torch.from_numpy(data).float()
+    # data = data.view(int(np.prod(s)), c)
+    # data = F.adaptive_avg_pool1d(data, output_size)
+    # data = data.view(*s, output_size)
+    # return data.numpy().astype(dtype)
+    return (
+        F.adaptive_avg_pool1d(
+            torch.from_numpy(data).float().view(int(np.prod(s)), c), output_size
+        )
+        .view(*s, output_size)
+        .numpy()
+        .astype(dtype)
+    )
 
 
 @lru_cache(maxsize=None)  # Cache indefinitely based on hsi_path
@@ -334,7 +453,7 @@ def get_kdtree(hsi_path: str) -> tuple[KDTree, list[str], list[tuple[float, floa
         if file.endswith(".npz"):
             try:
                 # Extract the coordinates from the file name
-                coord_x, coord_y, _ = file.split('_')
+                coord_x, coord_y, _ = file.split("_")
                 coord_x, coord_y = float(coord_x), float(coord_y)
                 coord_files.append(file)
                 coord_list.append((coord_x, coord_y))
@@ -369,6 +488,7 @@ class ImageDataset(Dataset):
         _hsi_coord_digits: int = 3,
         _calc_stats_mode: bool = False,
         _hsi_avg_dim: int | None = None,
+        _couple_rgb: bool = False,
     ):
         """
         Initialize the dataset with the given parameters.
@@ -405,6 +525,7 @@ class ImageDataset(Dataset):
             # hsi_ceil=hsi_ceil,
             split=split,
             _calc_stats_mode=_calc_stats_mode,
+            _couple_rgb=_couple_rgb,
         )
         self._transform_for_visual = GroupTransform(
             channel_stats=channel_stats,
@@ -413,6 +534,7 @@ class ImageDataset(Dataset):
             split=split,
             _calc_stats_mode=_calc_stats_mode,
             _no_norm=True,
+            _couple_rgb=_couple_rgb,
         )
 
     def __len__(self) -> int:
@@ -430,9 +552,7 @@ class ImageDataset(Dataset):
         self.transform = _transform
         return data
 
-    def __getitem__(
-        self, idx: int
-    ) -> dict[dict[str, torch.Tensor], dict[str, torch.Tensor], int]:
+    def __getitem__(self, idx: int) -> dict:
         """
         Get a sample from the dataset.
 
@@ -490,7 +610,11 @@ class ImageDataset(Dataset):
             else:
                 coords_rgb = row[["coord_x_rgb", "coord_y_rgb"]].to_numpy()
                 img = crop_image(
-                    np.array(Image.open(row[f"rand_image_{ig}_path"]).convert("RGB")),
+                    # np.array(Image.open(row[f"rand_image_{ig}_path"]).convert("RGB")),
+                    cv.cvtColor(
+                        cv.imread(row[f"rand_image_{ig}_path"], cv.IMREAD_COLOR),
+                        cv.COLOR_BGR2RGB,
+                    ),
                     center=coords_rgb,
                     crop_size=crop_size_init,
                 )
@@ -532,7 +656,7 @@ class ImageDataset(Dataset):
                 }
                 if ig == "hsi":
                     data_aug[ig]["hsi_channel_dropout"] = torch.zeros(
-                        len(self.hsi_wavelengths), dtype=bool
+                        len(self.hsi_wavelengths), dtype=torch.bool
                     )
                 if ig in row["image_groups_info"]:
                     data_aug[ig]["dropped"] = True
@@ -555,7 +679,7 @@ class ImageDataset(Dataset):
         hsi_path,
         hsi_channel_dropout,
         t: int = 4,
-        hsi_coord: tuple[float, float] = None,
+        hsi_coord: tuple[float, float] | None = None,
     ) -> np.ndarray:
         read_img_func = lambda x: cv.imread(
             os.path.join(hsi_path, x), cv.IMREAD_UNCHANGED
@@ -571,7 +695,7 @@ class ImageDataset(Dataset):
                     f"Nearest coordinate {nearest_coord} found with distance {dist:.4f} "
                     f"to expected coordinate {hsi_coord}. Distance must be < 0.1."
                 )
-            
+
             # Use the nearest neighbor's file name
             file_name = coord_files[index]
             img = np.load(os.path.join(hsi_path, file_name))["data"]
@@ -768,7 +892,7 @@ class TAMPICDataModule(L.LightningDataModule):
     def __init__(
         self,
         *,
-        metadata_train_path: dict,
+        metadata_train_path: str,
         val_easy_ratio: float = 0.3,
         # metadata_val_easy_path: dict,
         # metadata_val_mid_path: dict,
@@ -807,6 +931,7 @@ class TAMPICDataModule(L.LightningDataModule):
         num_devices: int,
         batch_size: int,
         num_workers: int,
+        prefetch_factor: int = 2,
         num_batches_per_epoch: Optional[int] = None,
         #
         _hsi_avg_dim: int | None = None,
@@ -816,6 +941,8 @@ class TAMPICDataModule(L.LightningDataModule):
         _stats_key: str = "0618_16s",
         _k_per_sample: int = 60,
         _calc_stats_mode: bool = False,
+        _couple_rgb: bool = False,
+        _hsi_wavelengths_overwrite: None | int = None,
         _log: int = 1,
     ):
         """
@@ -887,6 +1014,7 @@ class TAMPICDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_batches_per_epoch = num_batches_per_epoch
         self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
 
         # others
         self._hsi_avg_dim = _hsi_avg_dim
@@ -896,6 +1024,8 @@ class TAMPICDataModule(L.LightningDataModule):
         self._stats_key = _stats_key
         self._k_per_sample = _k_per_sample
         self._calc_stats_mode = _calc_stats_mode
+        self._couple_rgb = _couple_rgb
+        self._hsi_wavelengths_overwrite = _hsi_wavelengths_overwrite
         self._log = _log
 
     @staticmethod
@@ -948,10 +1078,13 @@ class TAMPICDataModule(L.LightningDataModule):
             if self._log:
                 self._report_df_stats(df_all)
                 self._report_label_stats(df_all)
-            _get_label_dist = lambda x: {
-                k: x["label_clean"].value_counts().to_dict().get(k, 0)
-                for k in self.label_clean2idx
-            }
+
+            def _get_label_dist(x):
+                return {
+                    k: x["label_clean"].value_counts().to_dict().get(k, 0)
+                    for k in self.label_clean2idx
+                }
+
             label_dist_df = pd.DataFrame(
                 {
                     "train": _get_label_dist(self.df_train_all),
@@ -960,11 +1093,15 @@ class TAMPICDataModule(L.LightningDataModule):
                 },
                 index=self.label_clean2idx,
             )
-            rprint(f"Final size of datasets:")
+            rprint("Final size of datasets:")
             rprint(f"\tTrain: {len(self.df_train_all)}. ")
             rprint(f"\tVal easy: {len(self.df_val_easy)}. ")
             rprint(f"\tVal mid: {len(self.df_val_mid)}. ")
-            rprint(tabulate(label_dist_df, tablefmt="outline"))
+            rprint(
+                tabulate(
+                    label_dist_df, label_dist_df.columns, tablefmt="rounded_outline"
+                )
+            )
         else:
             raise NotImplementedError(f"Stage {stage} not supported.")
 
@@ -990,12 +1127,16 @@ class TAMPICDataModule(L.LightningDataModule):
             _hsi_crop_size=self._hsi_crop_size,
             _calc_stats_mode=self._calc_stats_mode,
             _hsi_avg_dim=self._hsi_avg_dim,
+            _couple_rgb=self._couple_rgb,
         )
 
         return DataLoader(
             train_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            prefetch_factor=self.prefetch_factor,
+            # pin_memory=True,
+            persistent_workers=True,
             shuffle=False,
         )
 
@@ -1019,6 +1160,7 @@ class TAMPICDataModule(L.LightningDataModule):
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
             _hsi_avg_dim=self._hsi_avg_dim,
+            _couple_rgb=self._couple_rgb,
         )
 
         df_val_mid = self._set_randomness(self.df_val_mid, split="val")
@@ -1034,6 +1176,7 @@ class TAMPICDataModule(L.LightningDataModule):
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
             _hsi_avg_dim=self._hsi_avg_dim,
+            _couple_rgb=self._couple_rgb,
         )
 
         return [
@@ -1041,12 +1184,18 @@ class TAMPICDataModule(L.LightningDataModule):
                 val_dataset_1,
                 batch_size=self.batch_size,
                 num_workers=self.num_workers,
+                prefetch_factor=self.prefetch_factor,
+                # pin_memory=True,
+                persistent_workers=True,
                 shuffle=False,
             ),
             DataLoader(
                 val_dataset_2,
                 batch_size=self.batch_size,
                 num_workers=self.num_workers,
+                prefetch_factor=self.prefetch_factor,
+                # pin_memory=True,
+                persistent_workers=True,
                 shuffle=False,
             ),
         ]
@@ -1071,14 +1220,24 @@ class TAMPICDataModule(L.LightningDataModule):
             metadata = json.load(f)
         # load global properties
         global_properties = metadata["global_properties"]
-        self.num_hsi_channels = global_properties["hsi_num_channels"]
-        self.hsi_wavelengths = np.loadtxt(
+        self._num_hsi_channels = global_properties["hsi_num_channels"]
+        self._hsi_wavelengths = np.loadtxt(
             os.path.join(metadata_dir, global_properties["hsi_wavelengths"])
         )
+        assert self._num_hsi_channels == len(self._hsi_wavelengths)
+        if self._hsi_wavelengths_overwrite is None:
+            self.hsi_wavelengths = self._hsi_wavelengths
+            self.num_hsi_channels = self._num_hsi_channels
+        else:
+            self.hsi_wavelengths = np.array(self._hsi_wavelengths_overwrite)
+            self.num_hsi_channels = len(self.hsi_wavelengths)
         self._hsi_ceil = global_properties["hsi_ceil"]
         self.hsi_ceil = self._hsi_ceil if self._hsi_norm else None
         self.taxon_levels = np.array(global_properties["taxonomy_levels"])
-        self.taxon_level_idx = np.where(self.taxon_levels == self.taxon_level)[0][0]
+        self.taxon_level2idx = {
+            k: i for i, k in enumerate(self.taxon_levels)
+        }
+        self.taxon_level_idx = self.taxon_level2idx[self.taxon_level]
         self.stats = global_properties["stats"][self._stats_key]  # for normalization
         if self._hsi_avg_dim is not None:
             if self._hsi_avg_dim >= len(self.hsi_wavelengths):
@@ -1104,27 +1263,31 @@ class TAMPICDataModule(L.LightningDataModule):
                 continue
             with open(f"{metadata_dir}/{proj}/{meta_proj['amplicon_info']}") as f:
                 amplicon_info = json.load(f)
+            dfs_proj = []
             for plate, meta_plate in meta_proj["plates"].items():
                 rows = []
                 if meta_plate["status"] != "valid":
                     continue
-                sample_type = meta_plate["sample_type"]
-                medium_type = meta_plate["medium_type"]
+                sample_type = meta_plate.get("sample_type", "unknown")
+                medium_type = meta_plate.get("medium_type", "unknown")
                 num_isolates = len(amplicon_info[plate])
                 image_groups_info = {}
                 if "rgb" in meta_plate["images"]:
                     time_points_rgb = {
-                        int(k[1:]): {"red": v["red"], "white": v["white"]}
+                        # int(k[1:]): {"red": v["red"], "white": v["white"]}
+                        int(k[1:]): {"red": v.get("red"), "white": v.get("white")}
                         for k, v in meta_plate["images"]["rgb"].items()
                         if k != "default" and v["status"] == "valid"
                     }
                     image_groups_info["rgb-red"] = {
                         k: os.path.join(metadata_dir, proj, v["red"])
                         for k, v in time_points_rgb.items()
+                        if v["red"]
                     }
                     image_groups_info["rgb-white"] = {
                         k: os.path.join(metadata_dir, proj, v["white"])
                         for k, v in time_points_rgb.items()
+                        if v["white"]
                     }
                     transform_info = meta_plate["isolate_transform"]["to_rgb"]
                     func_transform_iso2rgb = get_query2target_func(
@@ -1199,7 +1362,7 @@ class TAMPICDataModule(L.LightningDataModule):
                     )
                 else:
                     df_plate[["coord_x_rgb", "coord_y_rgb"]] = None
-                dfs.append(df_plate)
+                dfs_proj.append(df_plate)
                 # if func_transform_rgb2hsi:
                 #     if func_transform_iso2rgb is None:
                 #         raise NotImplementedError(
@@ -1211,17 +1374,30 @@ class TAMPICDataModule(L.LightningDataModule):
                 # else:
                 #     df_plate[["coord_x_hsi", "coord_y_hsi"]] = None
 
+            df_proj = pd.concat(dfs_proj).reset_index(drop=True)
+            df_proj["split"] = df_proj["split"].replace("val", "val_mid")
+            rng = np.random.default_rng(random_split_seed)
+            df_proj.loc[
+                rng.choice(
+                    df_proj.query("split == 'train'").index,
+                    size=int(len(df_proj) * self.val_easy_ratio),
+                    replace=False,
+                ),
+                "split",
+            ] = "val_easy"
+            dfs.append(df_proj)
+
         df = pd.concat(dfs).reset_index(drop=True)
-        df["split"] = df["split"].replace("val", "val_mid")
-        rng = np.random.default_rng(random_split_seed)
-        df.loc[
-            rng.choice(
-                df.query("split == 'train'").index,
-                size=int(len(df) * self.val_easy_ratio),
-                replace=False,
-            ),
-            "split",
-        ] = "val_easy"
+        # df["split"] = df["split"].replace("val", "val_mid")
+        # rng = np.random.default_rng(random_split_seed)
+        # df.loc[
+        #     rng.choice(
+        #         df.query("split == 'train'").index,
+        #         size=int(len(df) * self.val_easy_ratio),
+        #         replace=False,
+        #     ),
+        #     "split",
+        # ] = "val_easy"
         return df
 
     def _fit_labels(self, df: pd.DataFrame) -> pd.DataFrame:
