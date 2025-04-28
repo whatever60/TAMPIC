@@ -1265,7 +1265,6 @@ class TAMPICDataModule(L.LightningDataModule):
                 continue
             with open(f"{metadata_dir}/{proj}/{meta_proj['amplicon_info']}") as f:
                 amplicon_info = json.load(f)
-            dfs_proj = []
             for plate, meta_plate in meta_proj["plates"].items():
                 rows = []
                 if meta_plate["status"] != "valid":
@@ -1320,7 +1319,7 @@ class TAMPICDataModule(L.LightningDataModule):
                 for isolate, meta_isolate in amplicon_info[plate].items():
                     if self.amplicon_type not in meta_isolate:
                         continue
-                    label, tax_all_levels = get_isolate_label(
+                    label = get_isolate_label(
                         meta_isolate[self.amplicon_type],
                         min_counts=self.min_counts,
                         min_counts_dominate=self.min_counts_dominate,
@@ -1328,8 +1327,6 @@ class TAMPICDataModule(L.LightningDataModule):
                         min_purity=self.min_purity,
                         taxon_level_idx=self.taxon_level_idx,
                     )
-                    if tax_all_levels is None:
-                        tax_all_levels = [label] * (self.taxon_level_idx + 1)
                     rows.append(
                         {
                             "project": proj,
@@ -1350,14 +1347,6 @@ class TAMPICDataModule(L.LightningDataModule):
                             "coord_x": meta_isolate["coord"][0],
                             "coord_y": meta_isolate["coord"][1],
                             "label": label,
-                            # "label_all_levels": {
-                            #     l: t
-                            #     for l, t in zip(
-                            #         self.taxon_levels[: self.taxon_level_idx],
-                            #         tax_all_levels,
-                            #     )
-                            # },
-                            "label_all_levels": tax_all_levels,
                             "split": meta_plate["split"][self.amplicon_type],
                         }
                     )
@@ -1374,7 +1363,7 @@ class TAMPICDataModule(L.LightningDataModule):
                     )
                 else:
                     df_plate[["coord_x_rgb", "coord_y_rgb"]] = None
-                dfs_proj.append(df_plate)
+                dfs.append(df_plate)
                 # if func_transform_rgb2hsi:
                 #     if func_transform_iso2rgb is None:
                 #         raise NotImplementedError(
@@ -1386,31 +1375,17 @@ class TAMPICDataModule(L.LightningDataModule):
                 # else:
                 #     df_plate[["coord_x_hsi", "coord_y_hsi"]] = None
 
-            df_proj = pd.concat(dfs_proj).reset_index(drop=True)
-            df_proj["split"] = df_proj["split"].replace("val", "val_mid")
-            rng = np.random.default_rng(random_split_seed)
-            random_split_seed = rng.integers(0, 2**32 - 1)
-            df_proj.loc[
-                rng.choice(
-                    df_proj.query("split == 'train'").index,
-                    size=int(len(df_proj) * self.val_easy_ratio),
-                    replace=False,
-                ),
-                "split",
-            ] = "val_easy"
-            dfs.append(df_proj)
-
         df = pd.concat(dfs).reset_index(drop=True)
-        # df["split"] = df["split"].replace("val", "val_mid")
-        # rng = np.random.default_rng(random_split_seed)
-        # df.loc[
-        #     rng.choice(
-        #         df.query("split == 'train'").index,
-        #         size=int(len(df) * self.val_easy_ratio),
-        #         replace=False,
-        #     ),
-        #     "split",
-        # ] = "val_easy"
+        df["split"] = df["split"].replace("val", "val_mid")
+        rng = np.random.default_rng(random_split_seed)
+        df.loc[
+            rng.choice(
+                df.query("split == 'train'").index,
+                size=int(len(df) * self.val_easy_ratio),
+                replace=False,
+            ),
+            "split",
+        ] = "val_easy"
         return df
 
     def _fit_labels(self, df: pd.DataFrame) -> pd.DataFrame:
