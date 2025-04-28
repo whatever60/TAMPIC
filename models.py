@@ -90,6 +90,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
                 "device": CatMetric(),
                 "index_in_df": CatMetric(),
                 "label": CatMetric(),
+                "embedding": CatMetric(),
                 "logits": CatMetric(),
                 "project_id": CatMetric(),
                 "plate_id": CatMetric(),
@@ -112,14 +113,13 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self._device_idx = device
         # self.device_str = f"{self.device.type}:{device}"
 
-
-    def forward(self, data, wavelengths):
-        return self.model(data, wavelengths)
+    def forward(self, data, wavelengths) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.model(data, wavelengths, _return_embedding=True)
 
     def training_step(self, batch, batch_idx):
         data = batch["data"]
         label = batch["label"]
-        logits = self(data, self.wavelengths.to(self.device))
+        logits, embedding = self(data, self.wavelengths.to(self.device))
         loss = F.cross_entropy(logits, label)
         self.metrics_acc_train.update(logits, label)
         self.log_dict(
@@ -129,20 +129,32 @@ class TAMPICResNetLightningModule(L.LightningModule):
             batch_size=self.batch_size,
         )
         self.log(
-            "train_loss", loss, on_step=True, on_epoch=True, batch_size=self.batch_size
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=self.batch_size,
         )
 
         self._update_prediction_on_step_end(
             dataset="train",
             batch_idx=batch_idx,
             label=label,
+            embedding=embedding,
             logits=logits,
             meta=batch["meta"],
         )
         return loss
 
     def _update_prediction_on_step_end(
-        self, dataset: str, batch_idx, label, logits, meta: dict
+        self,
+        dataset: str,
+        batch_idx: int,
+        embedding: torch.Tensor,
+        label: torch.Tensor,
+        logits: torch.Tensor,
+        meta: dict,
     ) -> None:
         if dataset == "train":
             logger_prediction = self.logger_prediction_train
@@ -157,6 +169,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
         logger_prediction["batch_idx"].update(torch.full((batch_size,), batch_idx))
         logger_prediction["device"].update(torch.full((batch_size,), self._device_idx))
         logger_prediction["label"].update(label)
+        logger_prediction["embedding"].update(embedding.detach())
         logger_prediction["logits"].update(logits.detach())
         logger_prediction["index_in_df"].update(meta["index_in_df"])
         # logger_prediction["project_id"].update(meta["project_id"])
@@ -178,26 +191,45 @@ class TAMPICResNetLightningModule(L.LightningModule):
             prefix = "val-mid"
         else:
             raise ValueError(f"Invalid dataset: {dataset}")
-
+        if not logger_prediction["embedding"].update_called:
+            # no data was logged, so don't save anything
+            return
+        embedding = logger_prediction["embedding"].compute().cpu().numpy()
         logits = logger_prediction["logits"].compute().cpu().numpy()
+        indexs = logger_prediction["index_in_df"].compute().cpu().numpy().astype(int)
+        embedding_df = pd.DataFrame(
+            embedding,
+            index=indexs,
+            columns=[f"embedding_{i}" for i in range(embedding.shape[1])],
+        )
         try:
             idx2label_clean = self.trainer.datamodule.idx2label_clean
             columns = [idx2label_clean[i] for i in range(len(idx2label_clean))]
         except AttributeError:
             columns = np.arange(logits.shape[1])
-        indexs = logger_prediction["index_in_df"].compute().cpu().numpy().astype(int)
         logits_df = pd.DataFrame(logits, columns=columns, index=indexs)
         other_info_df = pd.DataFrame(
             {
                 "epoch": logger_prediction["epoch"].compute().cpu().numpy().astype(int),
-                "batch_idx": logger_prediction["batch_idx"].compute().cpu().numpy().astype(int),
-                "device": logger_prediction["device"].compute().cpu().numpy().astype(int),
+                "batch_idx": logger_prediction["batch_idx"]
+                .compute()
+                .cpu()
+                .numpy()
+                .astype(int),
+                "device": logger_prediction["device"]
+                .compute()
+                .cpu()
+                .numpy()
+                .astype(int),
                 "label": logger_prediction["label"].compute().cpu().numpy().astype(int),
                 # "project_id": logger_prediction["project_id"].compute(),
                 # "plate_id": logger_prediction["plate_id"].compute(),
                 # "sample_id": logger_prediction["sample_id"].compute(),
             },
             index=indexs,
+        )
+        embedding_df.to_parquet(
+            f"{self._prediction_log_dir}/{prefix}_epoch-{self.current_epoch}_embedding.parquet"
         )
         logits_df.to_parquet(
             f"{self._prediction_log_dir}/{prefix}_epoch-{self.current_epoch}_logits.parquet"
@@ -212,8 +244,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
             m.reset()
 
     def on_train_start(self) -> None:
-        """Save dataset df datasets for all training and validation datasets.
-        """
+        """Save dataset df datasets for all training and validation datasets."""
         df_train = self.trainer.datamodule.df_train_all.copy()
         df_val_easy = self.trainer.datamodule.df_val_easy.copy()
         df_val_mid = self.trainer.datamodule.df_val_mid.copy()
@@ -228,7 +259,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         data = batch["data"]
         label = batch["label"]
-        logits = self(data, self.wavelengths.to(self.device))
+        logits, embedding = self(data, self.wavelengths.to(self.device))
         loss = F.cross_entropy(logits, label)
         if dataloader_idx == 0:
             metric_val_acc = self.metrics_acc_val_easy
@@ -244,6 +275,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
             loss,
             on_step=False,
             on_epoch=True,
+            prog_bar=True,
             batch_size=self.batch_size,
         )
 
@@ -251,6 +283,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
             dataset=["val_easy", "val_mid"][dataloader_idx],
             batch_idx=batch_idx,
             label=label,
+            embedding=embedding,
             logits=logits,
             meta=batch["meta"],
         )
