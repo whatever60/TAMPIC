@@ -672,7 +672,12 @@ class ImageDataset(Dataset):
             "index_in_df": self.df.index[idx],
         }
 
-        return {"data": data_aug, "meta": meta, "label": row["label_clean_idx"]}
+        return {
+            "data": data_aug,
+            "meta": meta,
+            "label": row["label_clean_idx"],
+            "label_all_levels": row["label_all_levels_clean_idx"],
+        }
 
     def _read_hsi(
         self,
@@ -1234,9 +1239,7 @@ class TAMPICDataModule(L.LightningDataModule):
         self._hsi_ceil = global_properties["hsi_ceil"]
         self.hsi_ceil = self._hsi_ceil if self._hsi_norm else None
         self.taxon_levels = np.array(global_properties["taxonomy_levels"])
-        self.taxon_level2idx = {
-            k: i for i, k in enumerate(self.taxon_levels)
-        }
+        self.taxon_level2idx = {k: i for i, k in enumerate(self.taxon_levels)}
         self.taxon_level_idx = self.taxon_level2idx[self.taxon_level]
         self.stats = global_properties["stats"][self._stats_key]  # for normalization
         if self._hsi_avg_dim is not None:
@@ -1318,7 +1321,7 @@ class TAMPICDataModule(L.LightningDataModule):
                 for isolate, meta_isolate in amplicon_info[plate].items():
                     if self.amplicon_type not in meta_isolate:
                         continue
-                    label = get_isolate_label(
+                    label, tax_all_levels = get_isolate_label(
                         meta_isolate[self.amplicon_type],
                         min_counts=self.min_counts,
                         min_counts_dominate=self.min_counts_dominate,
@@ -1326,6 +1329,8 @@ class TAMPICDataModule(L.LightningDataModule):
                         min_purity=self.min_purity,
                         taxon_level_idx=self.taxon_level_idx,
                     )
+                    if tax_all_levels is None:
+                        tax_all_levels = [label] * (self.taxon_level_idx + 1)
                     rows.append(
                         {
                             "project": proj,
@@ -1346,6 +1351,14 @@ class TAMPICDataModule(L.LightningDataModule):
                             "coord_x": meta_isolate["coord"][0],
                             "coord_y": meta_isolate["coord"][1],
                             "label": label,
+                            # "label_all_levels": {
+                            #     l: t
+                            #     for l, t in zip(
+                            #         self.taxon_levels[: self.taxon_level_idx],
+                            #         tax_all_levels,
+                            #     )
+                            # },
+                            "label_all_levels": tax_all_levels,
                             "split": meta_plate["split"][self.amplicon_type],
                         }
                     )
@@ -1377,6 +1390,7 @@ class TAMPICDataModule(L.LightningDataModule):
             df_proj = pd.concat(dfs_proj).reset_index(drop=True)
             df_proj["split"] = df_proj["split"].replace("val", "val_mid")
             rng = np.random.default_rng(random_split_seed)
+            random_split_seed = rng.integers(0, 2**32 - 1)
             df_proj.loc[
                 rng.choice(
                     df_proj.query("split == 'train'").index,
@@ -1412,36 +1426,59 @@ class TAMPICDataModule(L.LightningDataModule):
             1. self.keep_empty is True
             2. At least self.min_num_isolates are empty.
         """
-        label2idx = {}
-        label_clean2idx = {}
-        idx2label_clean = {}
+        label2idx_all: list[dict[str, int]] = []
+        label_clean2idx_all: list[dict[str, int]] = []
+        idx2label_clean_all: list[dict[int, str]] = []
+        # label_counts = df["label"].value_counts().to_dict()
 
-        label_counts = df["label"].value_counts().to_dict()
-        iter_label_counts = iter(label_counts.items())
-        i = 0
-        for label, count in iter_label_counts:
-            if label in ["impure", "ambiguous"]:
-                continue
-            if count >= self.min_num_isolates:
-                if self.keep_empty or label != "empty":
-                    label2idx[label] = i
-                    label_clean2idx[label] = i
-                    idx2label_clean[i] = label
-                    i += 1
-            else:
-                break
-        if self.keep_others:  # keep iterating
-            label_clean2idx["others"] = i
-            idx2label_clean[i] = "others"
+        for idx in range(self.taxon_level_idx + 1):
+            label_counts = (
+                pd.Series(
+                    [
+                        label_all_levels[idx]
+                        for label_all_levels in df["label_all_levels"]
+                    ]
+                )
+                .value_counts()
+                .to_dict()
+            )
+            label2idx = {}
+            label_clean2idx = {}
+            idx2label_clean = {}
+
+            iter_label_counts = iter(label_counts.items())
+            i = 0
             for label, count in iter_label_counts:
                 if label in ["impure", "ambiguous"]:
                     continue
-                label2idx[label] = i
-                i += 1
+                if count >= self.min_num_isolates:
+                    if self.keep_empty or label != "empty":
+                        label2idx[label] = i
+                        label_clean2idx[label] = i
+                        idx2label_clean[i] = label
+                        i += 1
+                else:
+                    break
+            if self.keep_others:  # keep iterating
+                label_clean2idx["others"] = i
+                idx2label_clean[i] = "others"
+                for label, count in iter_label_counts:
+                    if label in ["impure", "ambiguous"]:
+                        continue
+                    label2idx[label] = i
+                    i += 1
 
-        self.label2idx = label2idx
-        self.label_clean2idx = label_clean2idx
-        self.idx2label_clean = idx2label_clean
+            label2idx_all.append(label2idx)
+            label_clean2idx_all.append(label_clean2idx)
+            idx2label_clean_all.append(idx2label_clean)
+
+        self.label2idx = label2idx_all[self.taxon_level_idx]
+        self.label_clean2idx = label_clean2idx_all[self.taxon_level_idx]
+        self.idx2label_clean = idx2label_clean_all[self.taxon_level_idx]
+
+        self.label2idx_all = label2idx_all
+        self.label_clean2idx_all = label_clean2idx_all
+        self.idx2label_clean_all = idx2label_clean_all
 
     def _transform_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """Transform the labels in the DataFrame to numerical values."""
@@ -1455,6 +1492,21 @@ class TAMPICDataModule(L.LightningDataModule):
         df["label_clean"] = df["label_idx"].map(self.idx2label_clean)
         df = df.dropna(subset=["label_clean"]).copy()
         df["label_clean_idx"] = df["label_clean"].map(self.label_clean2idx).astype(int)
+
+        label_clean_idx_all_levels: list[list[int]] = []
+        for idx, (label2idx, label_clean2idx, idx2label_clean) in enumerate(
+            zip(self.label2idx_all, self.label_clean2idx_all, self.idx2label_clean_all)
+        ):
+            label = df["label_all_levels"].apply(lambda x: x[idx])
+            label_idx = label.map(label2idx)
+            label_clean = label_idx.map(idx2label_clean)
+            label_clean_idx = label_clean.map(label_clean2idx)
+            label_clean_idx_all_levels.append(label_clean_idx.to_list())
+        # [num_levels, num_rows]
+        label_clean_idx_all_levels_arr = np.array(label_clean_idx_all_levels).T
+        df["label_all_levels_clean_idx"] = pd.Series(
+            [i for i in label_clean_idx_all_levels_arr]
+        )
         return df
 
     def _add_weight(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1646,7 +1698,7 @@ def get_isolate_label(
     min_ratio: int = 2,
     min_purity: float = 0.0,
     taxon_level_idx: int = -1,
-) -> str:
+) -> tuple[str, None | list[str]]:
     """Get the label of an isolate given its amplicon sequencing.
     If an isolate is empty, the label is "empty". Otherwise, if an isolate is pure, the
         label is the taxonomy at given label. Otherwise, the label is "impure".
@@ -1660,17 +1712,17 @@ def get_isolate_label(
     zotus = np.array(isolate_info["zotus"])
     taxonomies = np.array(isolate_info["taxonomies"])
     if not zotus.shape[0]:
-        return "empty"
+        return "empty", None
     order = np.argsort(counts)[::-1]
     counts = counts[order]
     zotus = zotus[order]
     taxonomies = taxonomies[order]
-    ret = "impure"
+    ret = "impure", None
     if sum(counts) < min_counts:
         if zotus[0] == "#UNKNOWN":
-            ret = "empty"
+            ret = "empty", None
         else:
-            ret = "ambiguous"
+            ret = "ambiguous", None
     elif zotus[0] != "#UNKNOWN" and counts[0] >= min_counts_dominate:
         purity = counts[0] / sum(counts)
         if purity < min_purity:
@@ -1681,7 +1733,10 @@ def get_isolate_label(
             counts = np.delete(counts, unknown_idx)
             zotus = np.delete(zotus, unknown_idx)
         if len(counts) == 1 or counts[0] / counts[1] >= min_ratio:
-            ret = taxonomies[0]["taxon"][taxon_level_idx]
+            ret = (
+                taxonomies[0]["taxon"][taxon_level_idx],
+                taxonomies[0]["taxon"][: taxon_level_idx + 1],
+            )
     return ret
 
 
@@ -1752,8 +1807,10 @@ if __name__ == "__main__":
                 weight_by_density=False,
                 weight_density_kernel_size=50,
                 weight_by_plate=False,
-                # p_num_igs=None,
-                # p_igs=None,
+                p_num_igs={1: 0.3, 2: 0.7, 3: 0},
+                p_igs={"rgb-red": 2, "rgb-white": 3, "hsi": 0},
+                p_num_igs_val={1: 0.3, 2: 0.7, 3: 0},
+                p_igs_val={"rgb-red": 2, "rgb-white": 3, "hsi": 0},
                 p_last_time_point=0.6,
                 p_hsi_channels=0.9,
                 rng_seed=42,
@@ -1770,12 +1827,13 @@ if __name__ == "__main__":
                 target_mask_kernel_size=5,
                 num_devices=2,
                 batch_size=8,
-                num_workers=16,
+                num_workers=1,
                 num_batches_per_epoch=50,
                 # _hsi_group_k=3,
                 _hsi_crop_size=196,
                 _hsi_norm=True,
                 _hsi_avg_dim=100,
+                _hsi_wavelengths_overwrite=[],
             )
             dm.setup()
             dl_train = dm.val_dataloader()[0]
