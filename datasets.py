@@ -1069,14 +1069,13 @@ class TAMPICDataModule(L.LightningDataModule):
         """
         if stage in (None, "fit"):
             df_all = self._json_to_dataframe(self.metadata_train_path)
-            df_train_all = df_all.query("split == 'train'").copy()
-            self._fit_labels(df_train_all)
-            df_train_all = self._transform_labels(df_train_all)
+            self._fit_labels(df_all.query("split == 'train' | split == 'val_easy'"))
             # self._calc_training_stats(df_train_all)
-            self.df_train_all = self._add_weight(df_train_all)
 
+            df_train_all = df_all.query("split == 'train'").copy()
             df_val_easy = df_all.query("split == 'val_easy'").copy()
             df_val_mid = df_all.query("split == 'val_mid'").copy()
+            self.df_train_all = self._add_weight(self._transform_labels(df_train_all))
             self.df_val_easy = self._transform_labels(df_val_easy)
             self.df_val_mid = self._transform_labels(df_val_mid)
 
