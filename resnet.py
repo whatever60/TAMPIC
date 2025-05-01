@@ -1,10 +1,8 @@
 import copy
-import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
 from torchvision.models.resnet import ResNet, BasicBlock
 
 
@@ -61,29 +59,32 @@ class AdaptiveConvBlock(nn.Module):
 
 
 class _TAMPICConv2d(nn.Conv2d):
-    def forward(self, image: torch.tensor, wavelengths: torch.Tensor) -> torch.tensor:
+    def forward(self, image: torch.Tensor, wavelengths: torch.Tensor) -> torch.Tensor:
         return super().forward(image)
 
 
 class _HSIAvg(nn.Module):
-    """This is a module without learnable parameters that averages the HSI data across 
-    channels given output size utilizing adaptive 1d pooling. It also takes 
+    """This is a module without learnable parameters that averages the HSI data across
+    channels given output size utilizing adaptive 1d pooling. It also takes
     corresponding average for the wavelengths.
     """
+
     def __init__(self, output_size: int):
         super().__init__()
         self.output_size = output_size
         self.hsi_module = nn.AdaptiveAvgPool1d(output_size)
         self.wavelength_module = nn.AdaptiveAvgPool1d(output_size)
 
-    def forward(self, hsi: torch.Tensor, wavelengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, hsi: torch.Tensor, wavelengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # hsi: [batch_size, num_channels, height, width]
         # wavelengths: [batch_size, num_channels]
         b, c, h, w = hsi.size()
         hsi = hsi.permute(0, 2, 3, 1).view(b, h * w, c)
         hsi = self.hsi_module(hsi)
         hsi = hsi.view(b, h, w, self.output_size).permute(0, 3, 1, 2)
-        wavelengths = wavelengths.view(b, 1, c)
+        wavelengths = wavelengths.expand(b, 1, c)
         wavelengths = self.wavelength_module(wavelengths)
         wavelengths = wavelengths.view(b, self.output_size)
         return hsi, wavelengths
@@ -99,7 +100,7 @@ class TAMPICResNet(ResNet):
         num_classes=1000,
         state_dict=None,
         num_hsi_channels: int = 462,
-        _pretrained_hsi_base: bool = None,
+        _pretrained_hsi_base: bool = False,
         _norm_and_sum: bool = True,  # batch norm and sum
         _hsi_avg_dim: int | None = None,
     ):
@@ -125,8 +126,8 @@ class TAMPICResNet(ResNet):
             self.bn1_target_mask = nn.BatchNorm2d(64)
             self.new_param_name_prefixs.update(["bn1_hsi", "bn1_target_mask"])
         else:
-            self.bn1_hsi = (None,)
-            self.bn1_target_mask = None
+            self.bn1_hsi = nn.Identity()
+            self.bn1_target_mask = nn.Identity()
         nn.init.kaiming_normal_(
             self.conv1_hsi.conv.weight, mode="fan_out", nonlinearity="relu"
         )
@@ -159,7 +160,7 @@ class TAMPICResNet(ResNet):
                     num_hsi_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
                 )
                 # Copy weights from the pretrained conv1 (the first channel) to conv1_hsi
-                # don't do thi for bn1_hsi, it is trained from scratch no matter what
+                # don't do this for bn1_hsi, it is trained from scratch no matter what
                 self.conv1_hsi.weight.data.copy_(self.conv1.weight.data[:, :1])
                 try:
                     self.new_param_name_prefixs.remove("conv1_hsi")
@@ -219,26 +220,35 @@ class TAMPICResNet(ResNet):
                 params_pretrained.append(param)
         return params_pretrained, params_new
 
+    @staticmethod
+    def get_nonzero(data: dict, image_group: str) -> torch.Tensor:
+        return (data[image_group]["available"] & (~data[image_group]["dropped"])).int()
+
     def _forward_base_norm_and_sum(
         self, data: dict, wavelengths: torch.Tensor
     ) -> torch.Tensor:
         xs = []
         tms = []
-        for ig in self.image_groups:
-            dont_zero = (data[ig]["available"] & (~data[ig]["dropped"])).int()
-            # forward conv layer
-            bn1_layer = getattr(self, f"bn1_{ig}".replace("-", "_"))
-            # if ig == "hsi":
-            #     out = bn1_layer(self.conv1_hsi(data[ig]["image"], wavelengths))
-            # else:
-            conv1_layer = getattr(self, f"conv1_{ig}".replace("-", "_"))
-            out = bn1_layer(conv1_layer(data[ig]["image"], wavelengths))
-            out *= dont_zero.view(-1, 1, 1, 1)
-            xs.append(out)
+        for ig in self.image_groups:  # loop over image groups (modalities)
+            avail = self.get_nonzero(data, ig)
+
             # add target mask
             target_mask = data[ig]["target_mask"]
-            target_mask *= dont_zero.view(-1, 1, 1)
+            target_mask *= avail.view(-1, 1, 1)
             tms.append(target_mask)
+
+            if (avail == 0).all():
+                # Skip the image group if it's not available for the entire batch, but
+                # target mask is still added above
+                continue
+
+            # forward conv layer
+            bn1_layer = getattr(self, f"bn1_{ig}".replace("-", "_"))
+            conv1_layer = getattr(self, f"conv1_{ig}".replace("-", "_"))
+            out = bn1_layer(conv1_layer(data[ig]["image"], wavelengths))
+            out *= avail.view(-1, 1, 1, 1)
+            xs.append(out)
+
         xs.append(self.bn1_target_mask(self.conv1_target_mask(torch.stack(tms, dim=1))))
         x = torch.stack(xs).sum(0)
         x = self.relu(x)
@@ -277,17 +287,22 @@ class TAMPICResNet(ResNet):
 
     def forward(
         self,
-        data: dict,
+        data: dict[str, dict],
         wavelengths: torch.Tensor,
-    ) -> torch.Tensor:
-        if "hsi" in data:
+        _return_embedding: bool = False,  # backward compatibility
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # NOTE: In the current dataloader implementation, "hsi" will always be a key in 
+        # data. So strictly speaking we don't have to check if "hsi" is in data.
+        if "hsi" in data and self.get_nonzero(data, "hsi").any():
             hsi, wavelengths = self.conv0_hsi(data["hsi"]["image"], wavelengths)
             data["hsi"]["image"] = hsi
-        return self.fc(
-            self.avgpool(
-                self._forward_stem(self._forward_base(data, wavelengths))
-            ).flatten(1)
-        )
+        last_activation = self._forward_stem(self._forward_base(data, wavelengths))
+        embedding = self.avgpool(last_activation).flatten(1)
+        logits = self.fc(embedding)
+        if _return_embedding:
+            return logits, embedding
+        else:
+            return logits
 
 
 def resnet18_tampic(
@@ -390,6 +405,7 @@ def resnet50_tampic(
 if __name__ == "__main__":
     from torchvision.io import read_image
     from torchvision.models import ResNet50_Weights, ResNet18_Weights, ResNet34_Weights
+    from torchvision.models import ResNet
 
     # test adaptive conv block
     batch_size, num_channels, height, width = 2, 6, 224, 224
@@ -491,7 +507,9 @@ if __name__ == "__main__":
     # the same when using pretrained weights (41.3%).
     # Step 1: Initialize model with the best available weights
     weights = ResNet18_Weights.DEFAULT
-    model = torch.hub.load("pytorch/vision", "resnet18", weights="IMAGENET1K_V1")
+    model: ResNet = torch.hub.load(
+        "pytorch/vision", "resnet18", weights="IMAGENET1K_V1"
+    )
     model.eval()
     # Step 2: Initialize the inference transforms
     preprocess = weights.transforms()
