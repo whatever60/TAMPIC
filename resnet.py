@@ -31,13 +31,18 @@ class AdaptiveConvBlock(nn.Module):
         )
 
     def forward(self, x, wavelengths):
+        # x: [batch_size, num_channels, height, width]
+        # wavelengths: [num_channels], share for all samples in the batch
         batch_size, in_channels, height, width = x.size()
+        num_channels = wavelengths.size(0)
 
         # Map the scalar wavelengths using MLP
         # Let's assume the wavelengths are the same for all samples in the batch, so
         # that we can simply use the first sample
-        mapped_wavelengths = self.mlp(wavelengths.view(-1, 1)).view(
-            self.out_channels, -1, *self.kernel_size
+        mapped_wavelengths = (
+            self.mlp(wavelengths.view(-1, 1))
+            .view(num_channels, self.out_channels, *self.kernel_size)
+            .transpose(0, 1)
         )
 
         # Perform pairwise multiplication with the kernel
@@ -49,7 +54,7 @@ class AdaptiveConvBlock(nn.Module):
         # Perform the convolution with the combined kernels
         output = F.conv2d(
             x,
-            combined_kernels,
+            weight=combined_kernels,
             bias=self.conv.bias,
             stride=self.stride,
             padding=self.padding,
@@ -59,6 +64,8 @@ class AdaptiveConvBlock(nn.Module):
 
 
 class _TAMPICConv2d(nn.Conv2d):
+    """A wrapper around nn.Conv2d for interface consistency with AdaptiveConvBlock."""
+
     def forward(self, image: torch.Tensor, wavelengths: torch.Tensor) -> torch.Tensor:
         return super().forward(image)
 
@@ -79,7 +86,7 @@ class _HSIAvg(nn.Module):
         self, hsi: torch.Tensor, wavelengths: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # hsi: [batch_size, num_channels, height, width]
-        # wavelengths: [batch_size, num_channels]
+        # wavelengths: [num_channels], share for all samples in the batch
         b, c, h, w = hsi.size()
         hsi = hsi.permute(0, 2, 3, 1).view(b, h * w, c)
         hsi = self.hsi_module(hsi)
@@ -104,16 +111,16 @@ class TAMPICResNet(ResNet):
         _norm_and_sum: bool = True,  # batch norm and sum
         _hsi_avg_dim: int | None = None,
     ):
-        super(TAMPICResNet, self).__init__(block, layers, num_classes)
+        super().__init__(block, layers, num_classes)
         self._pretrained_hsi_base = _pretrained_hsi_base
         self._norm_and_sum = _norm_and_sum
         self.new_param_name_prefixs = set()
 
         if _hsi_avg_dim is not None:
-            self.conv0_hsi = _HSIAvg(_hsi_avg_dim)
             num_hsi_channels = _hsi_avg_dim
-        else:
-            self.conv0_hsi = lambda hsi, wavelengths: (hsi, wavelengths)
+        self.conv0_hsi = _HSIAvg(num_hsi_channels)
+        num_hsi_channels = _hsi_avg_dim
+        # self.conv0_hsi = lambda hsi, wavelengths: (hsi, wavelengths)
 
         self.conv1_hsi = AdaptiveConvBlock(
             1, 64, kernel_size=(7, 7), stride=2, padding=3, bias=False
@@ -291,7 +298,7 @@ class TAMPICResNet(ResNet):
         wavelengths: torch.Tensor,
         _return_embedding: bool = False,  # backward compatibility
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # NOTE: In the current dataloader implementation, "hsi" will always be a key in 
+        # NOTE: In the current dataloader implementation, "hsi" will always be a key in
         # data. So strictly speaking we don't have to check if "hsi" is in data.
         if "hsi" in data and self.get_nonzero(data, "hsi").any():
             hsi, wavelengths = self.conv0_hsi(data["hsi"]["image"], wavelengths)
@@ -400,124 +407,3 @@ def resnet50_tampic(
     )
 
     return model
-
-
-if __name__ == "__main__":
-    from torchvision.io import read_image
-    from torchvision.models import ResNet50_Weights, ResNet18_Weights, ResNet34_Weights
-    from torchvision.models import ResNet
-
-    # test adaptive conv block
-    batch_size, num_channels, height, width = 2, 6, 224, 224
-    out_channels = 64
-    kernel_size = (7, 7)
-    stride = 2
-    padding = 3
-    x = torch.randn(batch_size, num_channels, height, width)
-    wavelengths = torch.rand(num_channels)
-    block = AdaptiveConvBlock(num_channels, out_channels, kernel_size, stride, padding)
-    output = block(x, wavelengths)
-    assert output.size() == (batch_size, out_channels, height // 2, width // 2)
-    print(output.size())
-
-    # Dummy input
-    # ideally dropped can only be True where available is True, but for testing purposes
-    # we will ignore this constraint
-    data = {
-        "data": {
-            "rgb-white": {
-                "image": torch.randn(batch_size, 3, height, width),
-                "target_mask": torch.rand(batch_size, height, width),
-                "dropped": torch.randint(0, 2, (batch_size,)).bool(),
-                "available": torch.randint(0, 2, (batch_size,)).bool(),
-                "time_point": torch.randint(0, 10, (batch_size,)),
-                "time_points": ["abcd"] * batch_size,
-            },
-            "rgb-red": {
-                "image": torch.randn(batch_size, 3, height, width),
-                "target_mask": torch.rand(batch_size, height, width),
-                "dropped": torch.randint(0, 2, (batch_size,)).bool(),
-                "available": torch.randint(0, 2, (batch_size,)).bool(),
-                "time_point": torch.randint(0, 10, (batch_size,)),
-                "time_points": ["abcd"] * batch_size,
-            },
-            "hsi": {
-                "image": torch.randn(batch_size, num_channels, height, width),
-                "target_mask": torch.rand(batch_size, height, width),
-                "dropped": torch.randint(0, 2, (batch_size,)).bool(),
-                "available": torch.randint(0, 2, (batch_size,)).bool(),
-                "time_point": torch.randint(0, 10, (batch_size,)),
-                "time_points": ["abcd"] * batch_size,
-                "hsi_channel_dropout": torch.randint(
-                    0, 2, (batch_size, num_channels)
-                ).bool(),
-            },
-        },
-        "label": 2,
-    }
-    wavelengths = torch.linspace(-1, 1, num_channels)
-
-    # from scratch
-    model = resnet18_tampic(num_classes=30, pretrained=False)
-    output = model(data["data"], wavelengths)
-    _ = model.get_param_groups()
-    print(output.size())
-
-    # pretrained
-    model = resnet18_tampic(num_classes=30, pretrained=True)
-    output = model(data["data"], wavelengths)
-    _ = model.get_param_groups()
-    print(output.size())
-
-    # pretrained with hsi avg
-    model = resnet18_tampic(num_classes=30, pretrained=True, _hsi_avg_dim=8)
-    output = model(data["data"], wavelengths)
-    _ = model.get_param_groups()
-    print(output.size())
-
-    # test with an image
-    model = resnet18_tampic(num_classes=1000, pretrained=True, _reuse_head=True)
-    model.eval()
-    weights = ResNet18_Weights.DEFAULT
-    transform = weights.transforms()
-    img = read_image("test_data/kitten.jpg")
-    batch = transform(img).unsqueeze(0)
-
-    data = data.copy()
-    for ig in data["data"]:
-        data["data"][ig]["image"] *= 0
-        data["data"][ig]["target_mask"] *= 0
-        data["data"][ig]["available"] = torch.ones_like(data["data"][ig]["available"])
-        data["data"][ig]["dropped"] = torch.ones_like(data["data"][ig]["dropped"])
-    data["data"]["rgb-red"]["image"] += batch
-    data["data"]["rgb-red"]["available"] = torch.ones_like(
-        data["data"]["rgb-red"]["available"]
-    )
-    data["data"]["rgb-red"]["dropped"] = torch.zeros_like(
-        data["data"]["rgb-red"]["dropped"]
-    )
-
-    prediction = model(data["data"], wavelengths)[0].softmax(0)
-    class_id = prediction.argmax().item()
-    score = prediction[class_id].item()
-    category_name = weights.meta["categories"][class_id]
-    print(f"{category_name}: {100 * score:.1f}%")
-
-    # the following is from torchvision docs. Given our model arch, the score should be
-    # the same when using pretrained weights (41.3%).
-    # Step 1: Initialize model with the best available weights
-    weights = ResNet18_Weights.DEFAULT
-    model: ResNet = torch.hub.load(
-        "pytorch/vision", "resnet18", weights="IMAGENET1K_V1"
-    )
-    model.eval()
-    # Step 2: Initialize the inference transforms
-    preprocess = weights.transforms()
-    # Step 3: Apply inference preprocessing transforms
-    batch = preprocess(img).unsqueeze(0)
-    # Step 4: Use the model and print the predicted category
-    prediction = model(batch).squeeze(0).softmax(0)
-    class_id = prediction.argmax().item()
-    score = prediction[class_id].item()
-    category_name = weights.meta["categories"][class_id]
-    print(f"{category_name}: {100 * score:.1f}%")
