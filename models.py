@@ -13,59 +13,53 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from schedulers import WarmupScheduler
-from resnet import resnet18_tampic, resnet34_tampic, resnet50_tampic
+from resnet import resnet_tampic
 
 
 class TAMPICResNetLightningModule(L.LightningModule):
     def __init__(
         self,
-        model_type="resnet18",
+        model_type: str = "resnet18",
         *,
-        pretrained=True,
-        num_classes,
-        lr,
-        warmup_steps,
-        total_steps,
+        pretrained: bool = True,
+        num_classes: int,
+        lr: float,
+        warmup_steps: int,
+        total_steps: int,
         batch_size: int,
-        wavelengths,
+        wavelengths: np.ndarray,
         _pretrained_hsi_base: bool = False,
         _norm_and_sum: bool = True,
-        _prediction_log_dir: str = None,
+        _prediction_log_dir: str | None = None,
+        _multi_level_aux_loss_weight: float = 0.0,
+        _multi_level_num_classes: list[int] | None = None,
     ):
-        super(TAMPICResNetLightningModule, self).__init__()
+        super().__init__()
         self.save_hyperparameters()
-        if model_type == "resnet18":
-            self.model = resnet18_tampic(
-                num_classes=num_classes,
-                pretrained=pretrained,
-                num_wavelengths=len(wavelengths),
-                _pretrained_hsi_base=_pretrained_hsi_base,
-                _norm_and_sum=_norm_and_sum,
-            )
-        elif model_type == "resnet34":
-            self.model = resnet34_tampic(
-                num_classes=num_classes,
-                pretrained=pretrained,
-                num_wavelengths=len(wavelengths),
-                _pretrained_hsi_base=_pretrained_hsi_base,
-                _norm_and_sum=_norm_and_sum,
-            )
-        elif model_type == "resnet50":
-            self.model = resnet50_tampic(
-                num_classes=num_classes,
-                pretrained=pretrained,
-                num_wavelengths=len(wavelengths),
-                _pretrained_hsi_base=_pretrained_hsi_base,
-                _norm_and_sum=_norm_and_sum,
-            )
-        else:
-            raise NotImplementedError(f"Model type {model_type} not implemented")
+
+        depth_map = {"resnet18": 18, "resnet34": 34, "resnet50": 50}
+        if model_type not in depth_map:
+            raise ValueError(f"Unsupported model_type: {model_type}")
+
+        self.model = resnet_tampic(
+            depth=depth_map[model_type],
+            num_classes=num_classes,
+            pretrained=pretrained,
+            num_wavelengths=len(wavelengths),
+            _pretrained_hsi_base=_pretrained_hsi_base,
+            _norm_and_sum=_norm_and_sum,
+        )
+
         self.lr = lr
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
         self.batch_size = batch_size
         self.pretrained = pretrained
-        self.wavelengths = torch.from_numpy(wavelengths).float() / 1000 * 2 - 1
+        # self.wavelengths = torch.from_numpy(wavelengths).float() / 1000 * 2 - 1
+        self.wavelengths = self.register_buffer(
+            "wavelengths",
+            torch.from_numpy(wavelengths).float() / 1000 * 2 - 1,
+        )
         metrics_acc = MetricCollection(
             {
                 "top1_acc": MulticlassAccuracy(num_classes=num_classes, top_k=1),
@@ -113,13 +107,49 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self._device_idx = device
         # self.device_str = f"{self.device.type}:{device}"
 
+        self._add_aux_head()
+
+    def _add_aux_head(self) -> None:
+        if self.hparams._multi_level_aux_loss_weight > 0:
+            # self._multi_level_num_classes = self.hparams._multi_level_num_classes
+            # self._multi_level_aux_loss_weight = (
+            #     self.hparams._multi_level_aux_loss_weight
+            # )
+            self.fc_aux = nn.ModuleList(
+                [
+                    nn.Linear(self.model.fc.in_features, n_classes)
+                    for n_classes in self.hparams._multi_level_num_classes
+                ]
+            )
+        else:
+            self.fc_aux = None
+
+    def _compute_aux_loss(
+        self, logits_aux: list[torch.Tensor], labels_aux: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute auxiliary loss.
+
+        Args:
+            logits_aux: List of tensors, each (batch_size, n_classes) for each label.
+            labels_aux: (batch_size, num_labels_aux)
+
+        Returns:
+            Mean auxiliary loss.
+        """
+        return torch.stack(
+            [
+                F.cross_entropy(logits_aux[i], labels_aux[:, i])
+                for i in range(len(logits_aux))
+            ]
+        ).mean()
+
     def forward(self, data, wavelengths) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(data, wavelengths, _return_embedding=True)
 
     def training_step(self, batch, batch_idx):
         data = batch["data"]
         label = batch["label"]
-        logits, embedding = self(data, self.wavelengths.to(self.device))
+        logits, embedding = self(data, self.wavelengths)
         loss = F.cross_entropy(logits, label)
         self.metrics_acc_train.update(logits, label)
         self.log_dict(
@@ -128,6 +158,22 @@ class TAMPICResNetLightningModule(L.LightningModule):
             on_epoch=True,
             batch_size=self.batch_size,
         )
+
+        if self.fc_aux is not None:
+            labels_aux = batch["label_all_levels"]  # [batch_size, num_labels_aux]
+            logits_aux = [fc(embedding) for fc in self.fc_aux]
+            loss_aux = self._compute_aux_loss(logits_aux, labels_aux)
+            self.log(
+                "train_loss_all_levels",
+                loss_aux,
+                on_step=True,
+                on_epoch=True,
+                # prog_bar=True,
+                batch_size=self.batch_size,
+            )
+        else:
+            loss_aux = 0.0
+
         self.log(
             "train_loss",
             loss,
@@ -145,7 +191,8 @@ class TAMPICResNetLightningModule(L.LightningModule):
             logits=logits,
             meta=batch["meta"],
         )
-        return loss
+
+        return loss + loss_aux * self.hparams._multi_level_aux_loss_weight
 
     def _update_prediction_on_step_end(
         self,
@@ -259,7 +306,7 @@ class TAMPICResNetLightningModule(L.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         data = batch["data"]
         label = batch["label"]
-        logits, embedding = self(data, self.wavelengths.to(self.device))
+        logits, embedding = self(data, self.wavelengths)
         loss = F.cross_entropy(logits, label)
         if dataloader_idx == 0:
             metric_val_acc = self.metrics_acc_val_easy
@@ -270,6 +317,22 @@ class TAMPICResNetLightningModule(L.LightningModule):
         metric_val_acc.update(logits, label)
         metric_val_cm.update(logits, label)
         metric_name = ["val_easy_{}", "val_mid_{}"][dataloader_idx]
+
+        if self.fc_aux is not None:
+            labels_aux = batch["label_all_levels"]
+            logits_aux = [fc(embedding) for fc in self.fc_aux]
+            loss_aux = self._compute_aux_loss(logits_aux, labels_aux)
+            self.log(
+                metric_name.format("loss_all_levels"),
+                loss_aux,
+                on_step=False,
+                on_epoch=True,
+                # prog_bar=True,
+                batch_size=self.batch_size,
+            )
+        else:
+            loss_aux = 0.0
+
         self.log(
             metric_name.format("loss"),
             loss,
@@ -287,7 +350,8 @@ class TAMPICResNetLightningModule(L.LightningModule):
             logits=logits,
             meta=batch["meta"],
         )
-        return loss
+
+        return loss + loss_aux * self.hparams._multi_level_aux_loss_weight
 
     def on_validation_epoch_end(self) -> None:
         # log scalar metrics. compuate, log, reset
@@ -329,17 +393,20 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self._save_prediction_on_epoch_end("val-easy")
         self._save_prediction_on_epoch_end("val-mid")
 
+    def get_param_groups(self) -> list[dict]:
+        pretrained_params, new_params = self.model.get_param_groups()
+        params = [
+            {"params": pretrained_params, "lr": self.lr / 10},
+            {"params": new_params, "lr": self.lr},
+        ]
+        if self.hparams._multi_level_aux_loss_weight > 0:
+            params.append({"params": self.fc_aux.parameters(), "lr": self.lr})
+        return params
+
     def configure_optimizers(self):
         # Separate parameters into pretrained and newly initialized
-        pretrained_params = []
-        new_params = []
-        pretrained_params, new_params = self.model.get_param_groups()
-        optimizer = AdamW(
-            [
-                {"params": pretrained_params, "lr": self.lr / 10},
-                {"params": new_params, "lr": self.lr},
-            ]
-        )
+        params = self.get_param_groups()
+        optimizer = AdamW(params)
         scheduler = WarmupScheduler(
             optimizer,
             T_max=self.total_steps,

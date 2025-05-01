@@ -6,7 +6,7 @@ from torchvision.io import read_image
 from torchvision.models import ResNet18_Weights
 import lightning as L
 
-from resnet import AdaptiveConvBlock, resnet18_tampic  # adjust import path
+from resnet import AdaptiveConvBlock, resnet_tampic  # adjust import path
 
 
 def run_test() -> None:
@@ -62,16 +62,17 @@ def run_test() -> None:
     }
     wavelengths = torch.linspace(-1, 1, num_channels)
 
-    model = resnet18_tampic(num_classes=30, pretrained=False)
+    model = resnet_tampic(depth=18, num_classes=30, pretrained=False)
     print(model(data["data"], wavelengths).size())
 
-    model = resnet18_tampic(num_classes=30, pretrained=True)
+    model = resnet_tampic(depth=18, num_classes=30, pretrained=True)
     print(model(data["data"], wavelengths).size())
 
-    model = resnet18_tampic(num_classes=30, pretrained=True, _hsi_avg_dim=8)
+    model = resnet_tampic(depth=18, num_classes=30, pretrained=True, _hsi_avg_dim=8)
     print(model(data["data"], wavelengths).size())
 
-    model = resnet18_tampic(num_classes=1000, pretrained=True, _reuse_head=True)
+    model = resnet_tampic(depth=18, num_classes=1000, pretrained=True, _reuse_head=True)
+
     model.eval()
     weights = ResNet18_Weights.DEFAULT
     transform = weights.transforms()
@@ -160,9 +161,9 @@ def run_benchmark(device: str = "cuda", drop_hsi: bool = True) -> None:
         },
     }
 
-    model = resnet18_tampic(num_classes=30, pretrained=True, _hsi_avg_dim=None).to(
-        device
-    )
+    model = resnet_tampic(
+        depth=18, num_classes=30, pretrained=True, _hsi_avg_dim=None
+    ).to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters())
     criterion = torch.nn.CrossEntropyLoss()

@@ -312,35 +312,62 @@ class TAMPICResNet(ResNet):
             return logits
 
 
-def resnet18_tampic(
-    num_classes=1000,
-    pretrained=False,
+def resnet_tampic(
+    depth: int,
+    num_classes: int = 1000,
+    pretrained: bool = False,
     num_wavelengths: int = 462,
-    _pretrained_hsi_base=False,
-    _norm_and_sum=True,
+    _pretrained_hsi_base: bool = False,
+    _norm_and_sum: bool = True,
     _hsi_avg_dim: int | None = None,
     _reuse_head: bool = False,
 ):
-    # if pretrained:
-    #     state_dict = torch.hub.load_state_dict_from_url(
-    #         "https://download.pytorch.org/models/resnet18-5c106cde.pth", progress=True
-    #     )
-    # else:
-    #     state_dict = None
-    # model = TAMPICResNet(
-    #     BasicBlock, [2, 2, 2, 2], num_classes=num_classes, weights=ResNet18_Weights.IMAGENET1K_V1
-    # )
+    """
+    Construct a TAMPICResNet model based on the specified ResNet depth.
+
+    Args:
+        depth: Depth of ResNet (18, 34, or 50).
+        num_classes: Number of output classes.
+        pretrained: Whether to load ImageNet pretrained weights.
+        num_wavelengths: Number of input channels for hyperspectral imaging.
+        _pretrained_hsi_base: Whether to use pretrained weights for the HSI base.
+        _norm_and_sum: Whether to normalize and sum spectral bands.
+        _hsi_avg_dim: Optional dimension to reduce HSI input to.
+        _reuse_head: If True (only for ResNet-18), keep pretrained head.
+
+    Returns:
+        A TAMPICResNet model instance.
+    """
+    if depth == 18:
+        block = BasicBlock
+        layers = [2, 2, 2, 2]
+        weights_key = "IMAGENET1K_V1"
+        arch = "resnet18"
+    elif depth == 34:
+        block = BasicBlock
+        layers = [3, 4, 6, 3]
+        weights_key = "IMAGENET1K_V1"
+        arch = "resnet34"
+    elif depth == 50:
+        block = BasicBlock
+        layers = [3, 4, 6, 3]
+        weights_key = "IMAGENET1K_V2"
+        arch = "resnet50"
+    else:
+        raise ValueError(f"Unsupported ResNet depth: {depth}")
+
     if pretrained:
-        _model = torch.hub.load("pytorch/vision", "resnet18", weights="IMAGENET1K_V1")
+        _model = torch.hub.load("pytorch/vision", arch, weights=weights_key)
         state_dict = _model.state_dict()
-        if not _reuse_head:
-            del state_dict["fc.weight"]
-            del state_dict["fc.bias"]
+        if not (depth == 18 and _reuse_head):
+            state_dict.pop("fc.weight", None)
+            state_dict.pop("fc.bias", None)
     else:
         state_dict = None
-    model = TAMPICResNet(
-        BasicBlock,
-        [2, 2, 2, 2],
+
+    return TAMPICResNet(
+        block,
+        layers,
         num_classes=num_classes,
         state_dict=state_dict,
         num_hsi_channels=num_wavelengths,
@@ -348,62 +375,3 @@ def resnet18_tampic(
         _norm_and_sum=_norm_and_sum,
         _hsi_avg_dim=_hsi_avg_dim,
     )
-    return model
-
-
-def resnet34_tampic(
-    num_classes=1000,
-    pretrained=False,
-    num_wavelengths: int = 462,
-    _pretrained_hsi_base=False,
-    _norm_and_sum=True,
-    _hsi_avg_dim: int | None = None,
-):
-    if pretrained:
-        _model = torch.hub.load("pytorch/vision", "resnet34", weights="IMAGENET1K_V1")
-        state_dict = _model.state_dict()
-        del state_dict["fc.weight"]
-        del state_dict["fc.bias"]
-    else:
-        state_dict = None
-    model = TAMPICResNet(
-        BasicBlock,
-        [3, 4, 6, 3],
-        num_classes=num_classes,
-        state_dict=state_dict,
-        num_hsi_channels=num_wavelengths,
-        _pretrained_hsi_base=_pretrained_hsi_base,
-        _norm_and_sum=_norm_and_sum,
-        _hsi_avg_dim=_hsi_avg_dim,
-    )
-
-    return model
-
-
-def resnet50_tampic(
-    num_classes=1000,
-    pretrained=False,
-    num_wavelengths: int = 462,
-    _pretrained_hsi_base=False,
-    _norm_and_sum=True,
-    _hsi_avg_dim: int | None = None,
-):
-    if pretrained:
-        _model = torch.hub.load("pytorch/vision", "resnet50", weights="IMAGENET1K_V2")
-        state_dict = _model.state_dict()
-        del state_dict["fc.weight"]
-        del state_dict["fc.bias"]
-    else:
-        state_dict = None
-    model = TAMPICResNet(
-        BasicBlock,
-        [3, 4, 6, 3],
-        num_classes=num_classes,
-        state_dict=state_dict,
-        num_hsi_channels=num_wavelengths,
-        _pretrained_hsi_base=_pretrained_hsi_base,
-        _norm_and_sum=_norm_and_sum,
-        _hsi_avg_dim=_hsi_avg_dim,
-    )
-
-    return model
