@@ -468,7 +468,7 @@ def get_kdtree(hsi_path: str) -> tuple[KDTree, list[str], list[tuple[float, floa
 
 
 class ImageDataset(Dataset):
-    image_groups = ["rgb-red", "rgb-white", "hsi"]
+    image_groups_default = ["rgb-red", "rgb-white", "hsi"]
 
     def __init__(
         self,
@@ -482,6 +482,7 @@ class ImageDataset(Dataset):
         hsi_wavelengths: np.ndarray,
         hsi_ceil: int = None,
         split: str = "train",
+        image_groups: list | None = None,
         _hsi_group_k: int = 0,
         _hsi_crop_size: int = 0,
         _hsi_coord_digits: int = 3,
@@ -501,6 +502,9 @@ class ImageDataset(Dataset):
         """
         self.df = df
         self.target_mask_kernel_size = target_mask_kernel_size
+        self.image_groups = (
+            image_groups if image_groups is not None else self.image_groups_default
+        )
         if isinstance(crop_size_init, int):
             crop_size_init = {k: crop_size_init for k in self.image_groups}
         self.crop_size_init = crop_size_init
@@ -517,6 +521,21 @@ class ImageDataset(Dataset):
         # some sanity checks
         if self._hsi_group_k > 0 and self._hsi_crop_size > 0:
             raise ValueError("Cannot specify both _hsi_group_k and _hsi_crop_size.")
+
+        if self._hsi_avg_dim is not None:
+            if self._hsi_avg_dim >= len(self.hsi_wavelengths):
+                self.num_hsi_channels = self.hsi_wavelengths.shape[0]
+            else:
+                self.hsi_wavelengths = adaptive_avg_pool(
+                    self.hsi_wavelengths, self._hsi_avg_dim
+                )
+                self.num_hsi_channels = self.hsi_wavelengths.shape[0]
+                channel_stats["hsi"]["mean"] = adaptive_avg_pool(
+                    np.array(channel_stats["hsi"]["mean"]), self._hsi_avg_dim
+                ).tolist()
+                channel_stats["hsi"]["std"] = adaptive_avg_pool(
+                    np.array(channel_stats["hsi"]["std"]), self._hsi_avg_dim
+                ).tolist()
 
         self.transform = GroupTransform(
             channel_stats=channel_stats,
@@ -589,7 +608,9 @@ class ImageDataset(Dataset):
             crop_size_init = self.crop_size_init[ig]
             if ig == "hsi":
                 # 0 means a channel is dropped out, 1 means kept.
-                hsi_channel_dropout = row["rand_channel_dropout_hsi"]
+                hsi_channel_dropout = np.random.default_rng(
+                    row["rand_channel_dropout_hsi"]
+                ).integers(0, 2, size=self.num_hsi_channels)
                 coords_hsi = row[["coord_x_hsi", "coord_y_hsi"]].to_numpy()
                 # For efficiency in cropping and augmentation, we stack all the images
                 # that are not dropped in HSI group.
@@ -685,9 +706,9 @@ class ImageDataset(Dataset):
         t: int = 4,
         hsi_coord: tuple[float, float] | None = None,
     ) -> np.ndarray:
-        read_img_func = lambda x: cv.imread(
-            os.path.join(hsi_path, x), cv.IMREAD_UNCHANGED
-        )
+        def read_img_func(x):
+            return cv.imread(os.path.join(hsi_path, x), cv.IMREAD_UNCHANGED)
+
         if self._hsi_crop_size > 0:
             tree, coord_files, coord_list = get_kdtree(hsi_path)
             dist, index = tree.query(hsi_coord)
@@ -946,8 +967,9 @@ class TAMPICDataModule(L.LightningDataModule):
         _k_per_sample: int = 60,
         _calc_stats_mode: bool = False,
         _couple_rgb: bool = False,
-        _hsi_wavelengths_overwrite: None | int = None,
         _log: int = 1,
+        # deprecated arguments
+        _hsi_wavelengths_overwrite: None | int = None,
     ):
         """
         Initialize the data module with the given parameters.
@@ -1029,8 +1051,8 @@ class TAMPICDataModule(L.LightningDataModule):
         self._k_per_sample = _k_per_sample
         self._calc_stats_mode = _calc_stats_mode
         self._couple_rgb = _couple_rgb
-        self._hsi_wavelengths_overwrite = _hsi_wavelengths_overwrite
         self._log = _log
+        # self._hsi_wavelengths_overwrite = _hsi_wavelengths_overwrite
 
     @staticmethod
     def _report_df_stats(df: pd.DataFrame) -> None:
@@ -1127,6 +1149,7 @@ class TAMPICDataModule(L.LightningDataModule):
             hsi_wavelengths=self.hsi_wavelengths,
             hsi_ceil=self.hsi_ceil,
             split="train",
+            image_groups=[ig for ig, p in self.p_igs.items() if p == 0],
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
             _calc_stats_mode=self._calc_stats_mode,
@@ -1161,6 +1184,7 @@ class TAMPICDataModule(L.LightningDataModule):
             hsi_wavelengths=self.hsi_wavelengths,
             hsi_ceil=self.hsi_ceil,
             split="val",
+            image_groups=[ig for ig, p in self.p_igs_val.items() if p == 0],
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
             _hsi_avg_dim=self._hsi_avg_dim,
@@ -1177,6 +1201,7 @@ class TAMPICDataModule(L.LightningDataModule):
             hsi_wavelengths=self.hsi_wavelengths,
             hsi_ceil=self.hsi_ceil,
             split="val",
+            image_groups=[ig for ig, p in self.p_igs_val.items() if p > 0],
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
             _hsi_avg_dim=self._hsi_avg_dim,
@@ -1225,38 +1250,43 @@ class TAMPICDataModule(L.LightningDataModule):
         # load global properties
         global_properties = metadata["global_properties"]
 
-        self._num_hsi_channels = global_properties["hsi_num_channels"]
-        self._hsi_wavelengths = np.loadtxt(
+        # self._num_hsi_channels = global_properties["hsi_num_channels"]
+        # self._hsi_wavelengths = np.loadtxt(
+        #     os.path.join(metadata_dir, global_properties["hsi_wavelengths"])
+        # )
+        # assert self._num_hsi_channels == len(self._hsi_wavelengths)
+        # if self._hsi_wavelengths_overwrite is None:
+        #     self.hsi_wavelengths = self._hsi_wavelengths
+        #     self.num_hsi_channels = self._num_hsi_channels
+        # else:
+        #     self.hsi_wavelengths = np.array(self._hsi_wavelengths_overwrite)
+        #     self.num_hsi_channels = len(self.hsi_wavelengths)
+
+        self.num_hsi_channels = global_properties["hsi_num_channels"]
+        self.hsi_wavelengths = np.loadtxt(
             os.path.join(metadata_dir, global_properties["hsi_wavelengths"])
         )
-        assert self._num_hsi_channels == len(self._hsi_wavelengths)
-        if self._hsi_wavelengths_overwrite is None:
-            self.hsi_wavelengths = self._hsi_wavelengths
-            self.num_hsi_channels = self._num_hsi_channels
-        else:
-            self.hsi_wavelengths = np.array(self._hsi_wavelengths_overwrite)
-            self.num_hsi_channels = len(self.hsi_wavelengths)
-        
+
         self._hsi_ceil = global_properties["hsi_ceil"]
         self.hsi_ceil = self._hsi_ceil if self._hsi_norm else None
         self.taxon_levels = np.array(global_properties["taxonomy_levels"])
         self.taxon_level2idx = {k: i for i, k in enumerate(self.taxon_levels)}
         self.taxon_level_idx = self.taxon_level2idx[self.taxon_level]
         self.stats = global_properties["stats"][self._stats_key]  # for normalization
-        if self._hsi_avg_dim is not None:
-            if self._hsi_avg_dim >= len(self.hsi_wavelengths):
-                self._hsi_avg_dim = None
-            else:
-                self.hsi_wavelengths = adaptive_avg_pool(
-                    self.hsi_wavelengths, self._hsi_avg_dim
-                )
-                self.num_hsi_channels = self.hsi_wavelengths.shape[0]
-                self.stats["hsi"]["mean"] = adaptive_avg_pool(
-                    np.array(self.stats["hsi"]["mean"]), self._hsi_avg_dim
-                ).tolist()
-                self.stats["hsi"]["std"] = adaptive_avg_pool(
-                    np.array(self.stats["hsi"]["std"]), self._hsi_avg_dim
-                ).tolist()
+        # if self._hsi_avg_dim is not None:
+        #     if self._hsi_avg_dim >= len(self.hsi_wavelengths):
+        #         self._hsi_avg_dim = None
+        #     else:
+        #         self.hsi_wavelengths = adaptive_avg_pool(
+        #             self.hsi_wavelengths, self._hsi_avg_dim
+        #         )
+        #         self.num_hsi_channels = self.hsi_wavelengths.shape[0]
+        #         self.stats["hsi"]["mean"] = adaptive_avg_pool(
+        #             np.array(self.stats["hsi"]["mean"]), self._hsi_avg_dim
+        #         ).tolist()
+        #         self.stats["hsi"]["std"] = adaptive_avg_pool(
+        #             np.array(self.stats["hsi"]["std"]), self._hsi_avg_dim
+        #         ).tolist()
 
         # load information of each isolate (project id, plate id isolate id, available
         # modalities, available time point for each modality, path to all of the images
@@ -1676,16 +1706,17 @@ class TAMPICDataModule(L.LightningDataModule):
                         df.loc[j:j, ["coord_x_rgb", "coord_y_rgb"]].to_numpy()
                     )[0]
                     # 1 are kept, 0 are dropped.
-                    channel_dropout_mask = np.zeros(self.num_hsi_channels, dtype=bool)
-                    channel_dropout_mask[
-                        _rng.choice(
-                            self.num_hsi_channels,
-                            size=int(self.num_hsi_channels * self.p_hsi_channels),
-                            replace=False,
-                        )
-                    ] = 1
+                    # channel_dropout_mask = np.zeros(self.num_hsi_channels, dtype=bool)
+                    # channel_dropout_mask[
+                    #     _rng.choice(
+                    #         self.num_hsi_channels,
+                    #         size=int(self.num_hsi_channels * self.p_hsi_channels),
+                    #         replace=False,
+                    #     )
+                    # ] = 1
+                    # rng seed for bernoulli sampling
                     df.loc[j:j, f"rand_channel_dropout_{ig}"] = pd.Series(
-                        [channel_dropout_mask], index=[j]
+                        [_rng.integers(0, 2**32 - 1)], index=[j]
                     )
                 else:
                     # rgb-white or rgb-red. just store image path.
@@ -1846,7 +1877,6 @@ if __name__ == "__main__":
                 _hsi_crop_size=196,
                 _hsi_norm=True,
                 _hsi_avg_dim=100,
-                _hsi_wavelengths_overwrite=[],
             )
             dm.setup()
             dl_train = dm.val_dataloader()[1]
