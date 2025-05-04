@@ -1,0 +1,41 @@
+name: tampic
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy==2.2.5
+  - numba==0.61.2
+  - pynndescent==0.5.13
+  - umap-learn==0.5.7
+  - pandas==2.2.3
+  - scipy==1.15.2
+  - scikit-learn
+  - openpyxl
+  - pyarrow
+  - fastparquet
+  - albumentations
+  - opencv-python-headless
+  - matplotlib
+  - seaborn
+  - jupyter
+  - notebook
+  - jupyterlab
+  - ipykernel
+  - nb_conda
+  - ipywidgets
+  - tqdm
+  - rich
+  - pip
+  - pip:
+      - torch --index-url https://download.pytorch.org/whl/cu126
+      - torchvision --index-url https://download.pytorch.org/whl/cu126
+      - torchaudio --index-url https://download.pytorch.org/whl/cu126
+      - lightning
+      - tensorboard
+      - torchmetrics
+      - transformers
+      - datasets
+      - wandb
+      - optuna
+

@@ -68,7 +68,7 @@ def run_test() -> None:
     model = resnet_tampic(depth=18, num_classes=30, pretrained=True)
     print(model(data["data"], wavelengths).size())
 
-    model = resnet_tampic(depth=18, num_classes=30, pretrained=True, _hsi_avg_dim=8)
+    model = resnet_tampic(depth=18, num_classes=30, pretrained=True, hsi_avg_dim=8)
     print(model(data["data"], wavelengths).size())
 
     model = resnet_tampic(depth=18, num_classes=1000, pretrained=True, _reuse_head=True)

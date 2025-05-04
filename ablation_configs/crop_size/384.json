@@ -12,7 +12,7 @@
     "p_last_time_point_val": 1,
     "p_hsi_channels_val": 1,
     "crop_size_init": { "rgb-red": 384, "rgb-white": 384, "hsi": 274 },
-    "crop_size_final": 274,
+    "crop_size_final": 128,
     "keep_empty": false,
     "keep_others": true,
     "pretrained": true,

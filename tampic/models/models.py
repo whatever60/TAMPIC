@@ -12,8 +12,8 @@ from torchmetrics.aggregation import CatMetric
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from schedulers import WarmupScheduler
-from resnet import resnet_tampic
+from ..schedulers import WarmupScheduler
+from .resnet import resnet_tampic
 
 
 class TAMPICResNetLightningModule(L.LightningModule):
@@ -21,17 +21,22 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self,
         model_type: str = "resnet18",
         *,
+        hsi_conv_type: str = "identity",
+        hsi_avg_dim: int | None = None,
+        wavelengths: np.ndarray,
         pretrained: bool = True,
-        num_classes: int,
         lr: float,
         warmup_steps: int,
         total_steps: int,
         batch_size: int,
-        wavelengths: np.ndarray,
         _pretrained_hsi_base: bool = False,
         _norm_and_sum: bool = True,
         _prediction_log_dir: str | None = None,
         _multi_level_aux_loss_weight: float = 0.0,
+        _multi_level_label_clean2idx: dict[str, dict[str, int]] | None = None,
+        label_clean2idx: dict[str, int] | None = None,
+        # deprecated args
+        num_classes: int | None = None,
         _multi_level_num_classes: list[int] | None = None,
     ):
         super().__init__()
@@ -43,9 +48,10 @@ class TAMPICResNetLightningModule(L.LightningModule):
 
         self.model = resnet_tampic(
             depth=depth_map[model_type],
-            num_classes=num_classes,
+            num_classes=len(label_clean2idx),
             pretrained=pretrained,
-            num_wavelengths=len(wavelengths),
+            hsi_conv_type=hsi_conv_type,
+            hsi_avg_dim=len(wavelengths) if hsi_avg_dim is None else hsi_avg_dim,
             _pretrained_hsi_base=_pretrained_hsi_base,
             _norm_and_sum=_norm_and_sum,
         )
@@ -55,11 +61,64 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self.total_steps = total_steps
         self.batch_size = batch_size
         self.pretrained = pretrained
-        # self.wavelengths = torch.from_numpy(wavelengths).float() / 1000 * 2 - 1
-        self.wavelengths = self.register_buffer(
-            "wavelengths",
-            torch.from_numpy(wavelengths).float() / 1000 * 2 - 1,
-        )
+        self.wavelengths = torch.from_numpy(wavelengths).float() / 1000 * 2 - 1
+        # self.wavelengths = self.register_buffer(
+        #     "wavelengths",
+        #     torch.from_numpy(wavelengths).float() / 1000 * 2 - 1,
+        # )
+
+        # logging the prediction of the model, but using metrics to implement the logic
+        if _prediction_log_dir is None:
+            return
+        os.makedirs(_prediction_log_dir, exist_ok=True)
+        self._prediction_log_dir = _prediction_log_dir
+
+        device = self.device.index
+        if device is None:
+            device = 0
+        self._device_idx = device
+        # self.device_str = f"{self.device.type}:{device}"
+
+        self._add_aux_head()
+        self._add_metrics()
+
+    def _add_aux_head(self) -> None:
+        if self.hparams._multi_level_aux_loss_weight > 0:
+            # self._multi_level_num_classes = self.hparams._multi_level_num_classes
+            # self._multi_level_aux_loss_weight = (
+            #     self.hparams._multi_level_aux_loss_weight
+            # )
+            self.fc_aux = nn.ModuleList(
+                [
+                    nn.Linear(self.model.fc.in_features, n_classes)
+                    for n_classes in self.hparams._multi_level_num_classes
+                ]
+            )
+        else:
+            self.fc_aux = None
+
+
+    def _compute_aux_loss(
+        self, logits_aux: list[torch.Tensor], labels_aux: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute auxiliary loss.
+
+        Args:
+            logits_aux: List of tensors, each (batch_size, n_classes) for each label.
+            labels_aux: (batch_size, num_labels_aux)
+
+        Returns:
+            Mean auxiliary loss.
+        """
+        return torch.stack(
+            [
+                F.cross_entropy(logits_aux[i], labels_aux[:, i])
+                for i in range(len(logits_aux))
+            ]
+        ).mean()
+
+    def _add_metrics(self) -> None:
+        num_classes = len(self.hparams.label_clean2idx)
         metrics_acc = MetricCollection(
             {
                 "top1_acc": MulticlassAccuracy(num_classes=num_classes, top_k=1),
@@ -72,11 +131,6 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self.metric_cm_val_easy = MulticlassConfusionMatrix(num_classes=num_classes)
         self.metric_cm_val_mid = MulticlassConfusionMatrix(num_classes=num_classes)
 
-        # logging the prediction of the model, but using metrics to implement the logic
-        if _prediction_log_dir is None:
-            return
-        os.makedirs(_prediction_log_dir, exist_ok=True)
-        self._prediction_log_dir = _prediction_log_dir
         logger_prediction = nn.ModuleDict(
             {
                 "epoch": CatMetric(),
@@ -100,56 +154,16 @@ class TAMPICResNetLightningModule(L.LightningModule):
         self.logger_prediction_val_mid = {
             k: v.clone() for k, v in logger_prediction.items()
         }
-
-        device = self.device.index
-        if device is None:
-            device = 0
-        self._device_idx = device
-        # self.device_str = f"{self.device.type}:{device}"
-
-        self._add_aux_head()
-
-    def _add_aux_head(self) -> None:
-        if self.hparams._multi_level_aux_loss_weight > 0:
-            # self._multi_level_num_classes = self.hparams._multi_level_num_classes
-            # self._multi_level_aux_loss_weight = (
-            #     self.hparams._multi_level_aux_loss_weight
-            # )
-            self.fc_aux = nn.ModuleList(
-                [
-                    nn.Linear(self.model.fc.in_features, n_classes)
-                    for n_classes in self.hparams._multi_level_num_classes
-                ]
-            )
-        else:
-            self.fc_aux = None
-
-    def _compute_aux_loss(
-        self, logits_aux: list[torch.Tensor], labels_aux: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute auxiliary loss.
-
-        Args:
-            logits_aux: List of tensors, each (batch_size, n_classes) for each label.
-            labels_aux: (batch_size, num_labels_aux)
-
-        Returns:
-            Mean auxiliary loss.
-        """
-        return torch.stack(
-            [
-                F.cross_entropy(logits_aux[i], labels_aux[:, i])
-                for i in range(len(logits_aux))
-            ]
-        ).mean()
-
     def forward(self, data, wavelengths) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(data, wavelengths, _return_embedding=True)
 
     def training_step(self, batch, batch_idx):
         data = batch["data"]
         label = batch["label"]
-        logits, embedding = self(data, self.wavelengths)
+        logits, embedding = self(
+            data,
+            self.wavelengths.unsqueeze(0).expand(label.size(0), -1).to(self.device),
+        )
         loss = F.cross_entropy(logits, label)
         self.metrics_acc_train.update(logits, label)
         self.log_dict(

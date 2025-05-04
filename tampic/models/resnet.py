@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.resnet import ResNet, BasicBlock
 
+from .hs_conv import build_hsconv, init_conv
+
 
 class AdaptiveConvBlock(nn.Module):
     def __init__(
@@ -105,111 +107,140 @@ class TAMPICResNet(ResNet):
         block,
         layers,
         num_classes=1000,
+        *,
         state_dict=None,
-        num_hsi_channels: int = 462,
+        hsi_conv_type: str,
+        hsi_avg_dim: int = 462,
+        _reuse_head: bool = False,
         _pretrained_hsi_base: bool = False,
         _norm_and_sum: bool = True,  # batch norm and sum
-        _hsi_avg_dim: int | None = None,
+        # _hsi_avg_dim: int | None = None,
     ):
         super().__init__(block, layers, num_classes)
         self._pretrained_hsi_base = _pretrained_hsi_base
         self._norm_and_sum = _norm_and_sum
         self.new_param_name_prefixs = set()
 
-        if _hsi_avg_dim is not None:
-            num_hsi_channels = _hsi_avg_dim
-        self.conv0_hsi = _HSIAvg(num_hsi_channels)
-        num_hsi_channels = _hsi_avg_dim
+        # if _hsi_avg_dim is not None:
+        #     hsi_avg_dim = _hsi_avg_dim
+        # self.conv0_hsi = _HSIAvg(hsi_avg_dim)
+        # hsi_avg_dim = _hsi_avg_dim
         # self.conv0_hsi = lambda hsi, wavelengths: (hsi, wavelengths)
 
-        self.conv1_hsi = AdaptiveConvBlock(
-            1, 64, kernel_size=(7, 7), stride=2, padding=3, bias=False
+        self.conv1_hsi = build_hsconv(
+            hsi_conv_type,
+            in_channels=hsi_avg_dim,
+            out_channels=64,
+            kernel_size=7,
+            stride=2,
+            padding=3,
+            bias=False,
         )
         self.conv1_target_mask = nn.Conv2d(
             len(self.image_groups), 64, kernel_size=7, stride=2, padding=3, bias=False
         )
-        if self._norm_and_sum:
-            self.bn1_hsi = nn.BatchNorm2d(64)
-            self.bn1_target_mask = nn.BatchNorm2d(64)
-            self.new_param_name_prefixs.update(["bn1_hsi", "bn1_target_mask"])
-        else:
-            self.bn1_hsi = nn.Identity()
-            self.bn1_target_mask = nn.Identity()
-        nn.init.kaiming_normal_(
-            self.conv1_hsi.conv.weight, mode="fan_out", nonlinearity="relu"
-        )
-        nn.init.kaiming_normal_(
-            self.conv1_target_mask.weight, mode="fan_out", nonlinearity="relu"
-        )
-        self.new_param_name_prefixs.update(["conv1_hsi", "conv1_target_mask"])
 
-        if state_dict is not None:
+        # initialization
+        if state_dict is not None:  # load pretrained weights
             self.pretrained = True
+            if not _reuse_head:
+                state_dict.pop("fc.weight", None)
+                state_dict.pop("fc.bias", None)
+                self.new_param_name_prefixs.update(["conv1_target_mask", "fc"])
+            else:
+                if self.fc.weight.shape[0] != num_classes:
+                    raise ValueError(
+                        f"Number of classes in the pretrained model ({self.fc.weight.shape[0]}) "
+                        f"does not match the number of classes in the new model ({num_classes})."
+                    )
             self.load_state_dict(state_dict, strict=False)
             self.conv1_rgb_red = copy.deepcopy(self.conv1)
             self.conv1_rgb_white = copy.deepcopy(self.conv1)
-            self.conv1_rgb_red._forward = self.conv1_rgb_red.forward
-            self.conv1_rgb_red.forward = (
-                lambda data, wavelengths: self.conv1_rgb_red._forward(data)
-            )
-            self.conv1_rgb_white._forward = self.conv1_rgb_white.forward
-            self.conv1_rgb_white.forward = (
-                lambda data, wavelengths: self.conv1_rgb_white._forward(data)
-            )
+            # self.conv1_rgb_red._forward = self.conv1_rgb_red.forward
+            # self.conv1_rgb_red.forward = (
+            #     lambda data, wavelengths: self.conv1_rgb_red._forward(data)
+            # )
+            # self.conv1_rgb_white._forward = self.conv1_rgb_white.forward
+            # self.conv1_rgb_white.forward = (
+            #     lambda data, wavelengths: self.conv1_rgb_white._forward(data)
+            # )
+            if self._pretrained_hsi_base:
+                # self.conv1_hsi = _TAMPICConv2d(
+                #     hsi_avg_dim, 64, kernel_size=7, stride=2, padding=3, bias=False
+                # )
+                # # Copy weights from the pretrained conv1 (the first channel) to conv1_hsi
+                # # don't do this for bn1_hsi, it is trained from scratch no matter what
+                # self.conv1_hsi.weight.data.copy_(self.conv1.weight.data[:, :1])
+                # try:
+                #     self.new_param_name_prefixs.remove("conv1_hsi")
+                # except KeyError:
+                #     pass
+                self.conv1_hsi.init_conv(self.conv1.weight.data, None)
+                self.new_param_name_prefixs.update(
+                    [
+                        name
+                        for name, _ in self.conv1_hsi.named_parameters()
+                        if not name.startswith("conv1.")
+                    ]
+                )
+            else:
+                # Initialize weights for conv1_hsi
+                self.conv1_hsi.init_conv()
+                self.new_param_name_prefixs.update(["conv1_hsi"])
             if self._norm_and_sum:
                 self.bn1_rgb_red = copy.deepcopy(self.bn1)
                 self.bn1_rgb_white = copy.deepcopy(self.bn1)
+                self.bn1_hsi = copy.deepcopy(self.bn1)
+                self.bn1_target_mask = nn.BatchNorm2d(64)  # from scratch
             else:
-                self.bn1_rgb_red = None
-                self.bn1_rgb_white = None
-            if self._pretrained_hsi_base:
-                self.conv1_hsi = _TAMPICConv2d(
-                    num_hsi_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
-                )
-                # Copy weights from the pretrained conv1 (the first channel) to conv1_hsi
-                # don't do this for bn1_hsi, it is trained from scratch no matter what
-                self.conv1_hsi.weight.data.copy_(self.conv1.weight.data[:, :1])
-                try:
-                    self.new_param_name_prefixs.remove("conv1_hsi")
-                except KeyError:
-                    pass
-            else:
-                # Initialize weights for conv1_hsi
-                nn.init.kaiming_normal_(
-                    self.conv1_hsi.conv.weight, mode="fan_out", nonlinearity="relu"
-                )
+                self.bn1_rgb_red = nn.Identity()
+                self.bn1_rgb_white = nn.Identity()
+                self.bn1_hsi = nn.Identity()
+                self.bn1_target_mask = nn.Identity()
+            self.new_param_name_prefixs.update(["bn1_target_mask"])
+            del self.conv1
+            print(f"\tNew param name prefixes: {sorted(self.new_param_name_prefixs)}")
         else:
             self.pretrained = False
-            self.conv1_rgb_red = _TAMPICConv2d(
+            # self.conv1_rgb_red = _TAMPICConv2d(
+            self.conv1_rgb_red = nn.Conv2d(
                 3, 64, kernel_size=7, stride=2, padding=3, bias=False
             )
-            self.conv1_rgb_white = _TAMPICConv2d(
+            # self.conv1_rgb_white = _TAMPICConv2d(
+            self.conv1_rgb_white = nn.Conv2d(
                 3, 64, kernel_size=7, stride=2, padding=3, bias=False
             )
+            # Initialize weights for conv1_rgb_red and conv1_rgb_white
+            # nn.init.kaiming_normal_(
+            #     self.conv1_rgb_red.weight, mode="fan_out", nonlinearity="relu"
+            # )
+            # nn.init.kaiming_normal_(
+            #     self.conv1_rgb_white.weight, mode="fan_out", nonlinearity="relu"
+            # )
+            # nn.init.kaiming_normal_(
+            #     self.conv1_target_mask.weight, mode="fan_out", nonlinearity="relu"
+            # )
+            init_conv(self.conv1_rgb_red)
+            init_conv(self.conv1_rgb_white)
+            self.conv1_hsi.init_conv()
+            init_conv(self.conv1_target_mask)
             if self._norm_and_sum:
                 self.bn1_rgb_red = nn.BatchNorm2d(64)
                 self.bn1_rgb_white = nn.BatchNorm2d(64)
-                self.new_param_name_prefixs.update(["bn1_rgb_red", "bn1_rgb_white"])
+                self.bn1_hsi = nn.BatchNorm2d(64)
+                self.bn1_target_mask = nn.BatchNorm2d(64)
             else:
-                self.bn1_rgb_red = None
-                self.bn1_rgb_white = None
-            # Initialize weights for conv1_rgb_red and conv1_rgb_white
-            nn.init.kaiming_normal_(
-                self.conv1_rgb_red.weight, mode="fan_out", nonlinearity="relu"
-            )
-            nn.init.kaiming_normal_(
-                self.conv1_rgb_white.weight, mode="fan_out", nonlinearity="relu"
-            )
-            self.new_param_name_prefixs.update(["conv1_rgb_red", "conv1_rgb_white"])
+                self.bn1_rgb_red = nn.Identity()
+                self.bn1_rgb_white = nn.Identity()
+                self.bn1_hsi = nn.Identity()
+                self.bn1_target_mask = nn.Identity()
+            print("\tAll parameters are new.")
 
-        del self.conv1
         if self._norm_and_sum:
             self._forward_base = self._forward_base_norm_and_sum
             del self.bn1
         else:
             self._forward_base = self._forward_base_sum_and_norm
-
-        print(f"\tNew param name prefixes: {sorted(self.new_param_name_prefixs)}")
 
     def get_param_groups(self) -> tuple[list, list]:
         params_pretrained = []
@@ -252,7 +283,10 @@ class TAMPICResNet(ResNet):
             # forward conv layer
             bn1_layer = getattr(self, f"bn1_{ig}".replace("-", "_"))
             conv1_layer = getattr(self, f"conv1_{ig}".replace("-", "_"))
-            out = bn1_layer(conv1_layer(data[ig]["image"], wavelengths))
+            if ig == "hsi":
+                out = bn1_layer(conv1_layer(data[ig]["image"], wavelengths))
+            else:
+                out = bn1_layer(conv1_layer(data[ig]["image"]))
             out *= avail.view(-1, 1, 1, 1)
             xs.append(out)
 
@@ -300,9 +334,9 @@ class TAMPICResNet(ResNet):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # NOTE: In the current dataloader implementation, "hsi" will always be a key in
         # data. So strictly speaking we don't have to check if "hsi" is in data.
-        if "hsi" in data and self.get_nonzero(data, "hsi").any():
-            hsi, wavelengths = self.conv0_hsi(data["hsi"]["image"], wavelengths)
-            data["hsi"]["image"] = hsi
+        # if "hsi" in data and self.get_nonzero(data, "hsi").any():
+        #     hsi, wavelengths = self.conv0_hsi(data["hsi"]["image"], wavelengths)
+        #     data["hsi"]["image"] = hsi
         last_activation = self._forward_stem(self._forward_base(data, wavelengths))
         embedding = self.avgpool(last_activation).flatten(1)
         logits = self.fc(embedding)
@@ -316,10 +350,11 @@ def resnet_tampic(
     depth: int,
     num_classes: int = 1000,
     pretrained: bool = False,
-    num_wavelengths: int = 462,
+    hsi_conv_type: str = "gating",
+    hsi_avg_dim: int = 462,
     _pretrained_hsi_base: bool = False,
     _norm_and_sum: bool = True,
-    _hsi_avg_dim: int | None = None,
+    # _hsi_avg_dim: int | None = None,
     _reuse_head: bool = False,
 ):
     """
@@ -329,10 +364,9 @@ def resnet_tampic(
         depth: Depth of ResNet (18, 34, or 50).
         num_classes: Number of output classes.
         pretrained: Whether to load ImageNet pretrained weights.
-        num_wavelengths: Number of input channels for hyperspectral imaging.
+        hsi_avg_dim: Average dimension for hyperspectral imaging.
         _pretrained_hsi_base: Whether to use pretrained weights for the HSI base.
         _norm_and_sum: Whether to normalize and sum spectral bands.
-        _hsi_avg_dim: Optional dimension to reduce HSI input to.
         _reuse_head: If True (only for ResNet-18), keep pretrained head.
 
     Returns:
@@ -342,26 +376,21 @@ def resnet_tampic(
         block = BasicBlock
         layers = [2, 2, 2, 2]
         weights_key = "IMAGENET1K_V1"
-        arch = "resnet18"
     elif depth == 34:
         block = BasicBlock
         layers = [3, 4, 6, 3]
         weights_key = "IMAGENET1K_V1"
-        arch = "resnet34"
     elif depth == 50:
         block = BasicBlock
         layers = [3, 4, 6, 3]
         weights_key = "IMAGENET1K_V2"
-        arch = "resnet50"
     else:
         raise ValueError(f"Unsupported ResNet depth: {depth}")
 
+    arch = f"resnet{depth}"
     if pretrained:
         _model = torch.hub.load("pytorch/vision", arch, weights=weights_key)
         state_dict = _model.state_dict()
-        if not (depth == 18 and _reuse_head):
-            state_dict.pop("fc.weight", None)
-            state_dict.pop("fc.bias", None)
     else:
         state_dict = None
 
@@ -370,8 +399,9 @@ def resnet_tampic(
         layers,
         num_classes=num_classes,
         state_dict=state_dict,
-        num_hsi_channels=num_wavelengths,
+        hsi_conv_type=hsi_conv_type,
+        hsi_avg_dim=hsi_avg_dim,
+        _reuse_head=_reuse_head,
         _pretrained_hsi_base=_pretrained_hsi_base,
         _norm_and_sum=_norm_and_sum,
-        _hsi_avg_dim=_hsi_avg_dim,
     )

@@ -10,7 +10,6 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
-from torchvision import transforms as T
 import lightning as L
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -21,8 +20,8 @@ from rich import print as rprint
 from tabulate import tabulate
 from joblib import Parallel, delayed
 
-from affine_transform import get_query2target_func
-from crop_image import crop_image
+from ..utils.affine_transform import get_query2target_func
+from ..utils.crop_image import crop_image
 
 
 class _HSINormalize(A.Normalize):
@@ -676,7 +675,7 @@ class ImageDataset(Dataset):
             "data": data_aug,
             "meta": meta,
             "label": row["label_clean_idx"],
-            "label_all_levels": row["label_all_levels_clean_idx"],
+            "label_all_levels": torch.tensor(row["label_all_levels_clean_idx"]),
         }
 
     def _read_hsi(
@@ -1097,6 +1096,7 @@ class TAMPICDataModule(L.LightningDataModule):
                 },
                 index=self.label_clean2idx,
             )
+            self.label_dist_df = label_dist_df
             rprint("Final size of datasets:")
             rprint(f"\tTrain: {len(self.df_train_all)}. ")
             rprint(f"\tVal easy: {len(self.df_val_easy)}. ")
@@ -1224,6 +1224,7 @@ class TAMPICDataModule(L.LightningDataModule):
             metadata = json.load(f)
         # load global properties
         global_properties = metadata["global_properties"]
+
         self._num_hsi_channels = global_properties["hsi_num_channels"]
         self._hsi_wavelengths = np.loadtxt(
             os.path.join(metadata_dir, global_properties["hsi_wavelengths"])
@@ -1235,6 +1236,7 @@ class TAMPICDataModule(L.LightningDataModule):
         else:
             self.hsi_wavelengths = np.array(self._hsi_wavelengths_overwrite)
             self.num_hsi_channels = len(self.hsi_wavelengths)
+        
         self._hsi_ceil = global_properties["hsi_ceil"]
         self.hsi_ceil = self._hsi_ceil if self._hsi_norm else None
         self.taxon_levels = np.array(global_properties["taxonomy_levels"])
@@ -1260,146 +1262,16 @@ class TAMPICDataModule(L.LightningDataModule):
         # modalities, available time point for each modality, path to all of the images
         # in dict, label)
         dfs = []
+        rng = np.random.default_rng(random_split_seed)
         for proj, meta_proj in metadata["data"].items():
-            if meta_proj["status"] != "valid":
-                continue
-            with open(f"{metadata_dir}/{proj}/{meta_proj['amplicon_info']}") as f:
-                amplicon_info = json.load(f)
-            dfs_proj = []
-            for plate, meta_plate in meta_proj["plates"].items():
-                rows = []
-                if meta_plate["status"] != "valid":
-                    continue
-                sample_type = meta_plate.get("sample_type", "unknown")
-                medium_type = meta_plate.get("medium_type", "unknown")
-                num_isolates = len(amplicon_info[plate])
-                image_groups_info = {}
-                if "rgb" in meta_plate["images"]:
-                    time_points_rgb = {
-                        # int(k[1:]): {"red": v["red"], "white": v["white"]}
-                        int(k[1:]): {"red": v.get("red"), "white": v.get("white")}
-                        for k, v in meta_plate["images"]["rgb"].items()
-                        if k != "default" and v["status"] == "valid"
-                    }
-                    image_groups_info["rgb-red"] = {
-                        k: os.path.join(metadata_dir, proj, v["red"])
-                        for k, v in time_points_rgb.items()
-                        if v["red"]
-                    }
-                    image_groups_info["rgb-white"] = {
-                        k: os.path.join(metadata_dir, proj, v["white"])
-                        for k, v in time_points_rgb.items()
-                        if v["white"]
-                    }
-                    transform_info = meta_plate["isolate_transform"]["to_rgb"]
-                    func_transform_iso2rgb = get_query2target_func(
-                        **transform_info["params"],
-                        **transform_info["stats"],
-                        flip=transform_info["flip"],
-                    )
-                else:
-                    func_transform_iso2rgb = None
-                if "hsi" in meta_plate["images"]:
-                    time_points_hsi = {
-                        int(k[1:]): {
-                            "dir": os.path.join(metadata_dir, proj, v["dir"]),
-                            "transform": v["transform"]["from_rgb"],
-                        }
-                        for k, v in meta_plate["images"]["hsi"].items()
-                        if k != "default" and v["status"] == "valid"
-                    }
-                    image_groups_info["hsi"] = time_points_hsi
-                image_groups_available = [k for k, v in image_groups_info.items() if v]
-
-                # for removing plates missing nessesary image groups.
-                p = np.array([self.p_igs[ig] for ig in image_groups_available])
-                p_val = np.array([self.p_igs_val[ig] for ig in image_groups_available])
-                if not (p.max() > 0 and p_val.max() > 0):
-                    continue
-
-                for isolate, meta_isolate in amplicon_info[plate].items():
-                    if self.amplicon_type not in meta_isolate:
-                        continue
-                    label, tax_all_levels = get_isolate_label(
-                        meta_isolate[self.amplicon_type],
-                        min_counts=self.min_counts,
-                        min_counts_dominate=self.min_counts_dominate,
-                        min_ratio=self.min_ratio,
-                        min_purity=self.min_purity,
-                        taxon_level_idx=self.taxon_level_idx,
-                    )
-                    if tax_all_levels is None:
-                        tax_all_levels = [label] * (self.taxon_level_idx + 1)
-                    rows.append(
-                        {
-                            "project": proj,
-                            "plate": plate,
-                            "sample_type": sample_type,
-                            "medium_type": medium_type,
-                            "num_isolates": num_isolates,
-                            # "transform_iso2rgb": meta_plate["transform"][
-                            #     "isolate_to_rgb"
-                            # ],
-                            # "transform_rgb2hsi": meta_plate["transform"]["rgb_to_hsi"],
-                            "image_groups_info": image_groups_info,
-                            "image_groups_available": image_groups_available,
-                            # "available_time_points_rgb-red": available_time_points_rgb-red,
-                            # "available_time_points_rgb-white": available_time_points_rgb-white,
-                            # "available_time_points_hsi": available_time_points_hsi,
-                            "isolate": isolate,
-                            "coord_x": meta_isolate["coord"][0],
-                            "coord_y": meta_isolate["coord"][1],
-                            "label": label,
-                            # "label_all_levels": {
-                            #     l: t
-                            #     for l, t in zip(
-                            #         self.taxon_levels[: self.taxon_level_idx],
-                            #         tax_all_levels,
-                            #     )
-                            # },
-                            "label_all_levels": tax_all_levels,
-                            "split": meta_plate["split"][self.amplicon_type],
-                        }
-                    )
-                if not rows:
-                    continue
-                df_plate = pd.DataFrame(rows)
-                # transform isolate coords on to the frame of RGB.
-                # We assume all samples have RGB images.
-                # Coords in HSI frame are calculated later in the step of calculating
-                # randomness.
-                if func_transform_iso2rgb:
-                    df_plate[["coord_x_rgb", "coord_y_rgb"]] = func_transform_iso2rgb(
-                        df_plate[["coord_x", "coord_y"]].to_numpy()
-                    )
-                else:
-                    df_plate[["coord_x_rgb", "coord_y_rgb"]] = None
-                dfs_proj.append(df_plate)
-                # if func_transform_rgb2hsi:
-                #     if func_transform_iso2rgb is None:
-                #         raise NotImplementedError(
-                #             "RGB must be available to transform to HSI"
-                #         )
-                #     df_plate[["coord_x_hsi", "coord_y_hsi"]] = func_transform_rgb2hsi(
-                #         df_plate[["coord_x_rgb", "coord_y_rgb"]].to_numpy()
-                #     )
-                # else:
-                #     df_plate[["coord_x_hsi", "coord_y_hsi"]] = None
-
-            df_proj = pd.concat(dfs_proj).reset_index(drop=True)
-            df_proj["split"] = df_proj["split"].replace("val", "val_mid")
-            rng = np.random.default_rng(random_split_seed)
-            random_split_seed = rng.integers(0, 2**32 - 1)
-            df_proj.loc[
-                rng.choice(
-                    df_proj.query("split == 'train'").index,
-                    size=int(len(df_proj) * self.val_easy_ratio),
-                    replace=False,
-                ),
-                "split",
-            ] = "val_easy"
+            df_proj = self._dict_to_dataframe_proj(
+                meta_proj,
+                base_dir=os.path.join(metadata_dir, proj),
+                random_seed=rng.integers(0, 2**32 - 1),
+            )
+            # if df_proj is not None:
+            df_proj["project"] = proj
             dfs.append(df_proj)
-
         df = pd.concat(dfs).reset_index(drop=True)
         # df["split"] = df["split"].replace("val", "val_mid")
         # rng = np.random.default_rng(random_split_seed)
@@ -1412,6 +1284,148 @@ class TAMPICDataModule(L.LightningDataModule):
         #     "split",
         # ] = "val_easy"
         return df
+
+    def _dict_to_dataframe_proj(
+        self, meta_proj: dict, base_dir: str, random_seed: int
+    ) -> pd.DataFrame:
+        # if meta_proj["status"] != "valid":
+        #     return None
+        with open(f"{base_dir}/{meta_proj['amplicon_info']}") as f:
+            amplicon_info = json.load(f)
+        dfs_proj = []
+        for plate, meta_plate in meta_proj["plates"].items():
+            rows = []
+            if meta_plate["status"] != "valid":
+                continue
+            sample_type = meta_plate.get("sample_type", "unknown")
+            medium_type = meta_plate.get("medium_type", "unknown")
+            num_isolates = len(amplicon_info[plate])
+            image_groups_info = {}
+            if "rgb" in meta_plate["images"]:
+                time_points_rgb = {
+                    # int(k[1:]): {"red": v["red"], "white": v["white"]}
+                    int(k[1:]): {"red": v.get("red"), "white": v.get("white")}
+                    for k, v in meta_plate["images"]["rgb"].items()
+                    if k != "default" and v["status"] == "valid"
+                }
+                image_groups_info["rgb-red"] = {
+                    k: os.path.join(base_dir, v["red"])
+                    for k, v in time_points_rgb.items()
+                    if v["red"]
+                }
+                image_groups_info["rgb-white"] = {
+                    k: os.path.join(base_dir, v["white"])
+                    for k, v in time_points_rgb.items()
+                    if v["white"]
+                }
+                transform_info = meta_plate["isolate_transform"]["to_rgb"]
+                func_transform_iso2rgb = get_query2target_func(
+                    **transform_info["params"],
+                    **transform_info["stats"],
+                    flip=transform_info["flip"],
+                )
+            else:
+                func_transform_iso2rgb = None
+            if "hsi" in meta_plate["images"]:
+                time_points_hsi = {
+                    int(k[1:]): {
+                        "dir": os.path.join(base_dir, v["dir"]),
+                        "transform": v["transform"]["from_rgb"],
+                    }
+                    for k, v in meta_plate["images"]["hsi"].items()
+                    if k != "default" and v["status"] == "valid"
+                }
+                image_groups_info["hsi"] = time_points_hsi
+            image_groups_available = [k for k, v in image_groups_info.items() if v]
+
+            # for removing plates missing nessesary image groups.
+            p = np.array([self.p_igs[ig] for ig in image_groups_available])
+            p_val = np.array([self.p_igs_val[ig] for ig in image_groups_available])
+            if not (p.max() > 0 and p_val.max() > 0):
+                continue
+
+            for isolate, meta_isolate in amplicon_info[plate].items():
+                if self.amplicon_type not in meta_isolate:
+                    continue
+                label, tax_all_levels = get_isolate_label(
+                    meta_isolate[self.amplicon_type],
+                    min_counts=self.min_counts,
+                    min_counts_dominate=self.min_counts_dominate,
+                    min_ratio=self.min_ratio,
+                    min_purity=self.min_purity,
+                    taxon_level_idx=self.taxon_level_idx,
+                )
+                if tax_all_levels is None:
+                    tax_all_levels = [label] * (self.taxon_level_idx + 1)
+                rows.append(
+                    {
+                        "plate": plate,
+                        "sample_type": sample_type,
+                        "medium_type": medium_type,
+                        "num_isolates": num_isolates,
+                        # "transform_iso2rgb": meta_plate["transform"][
+                        #     "isolate_to_rgb"
+                        # ],
+                        # "transform_rgb2hsi": meta_plate["transform"]["rgb_to_hsi"],
+                        "image_groups_info": image_groups_info,
+                        "image_groups_available": image_groups_available,
+                        # "available_time_points_rgb-red": available_time_points_rgb-red,
+                        # "available_time_points_rgb-white": available_time_points_rgb-white,
+                        # "available_time_points_hsi": available_time_points_hsi,
+                        "isolate": isolate,
+                        "coord_x": meta_isolate["coord"][0],
+                        "coord_y": meta_isolate["coord"][1],
+                        "label": label,
+                        # "label_all_levels": {
+                        #     l: t
+                        #     for l, t in zip(
+                        #         self.taxon_levels[: self.taxon_level_idx],
+                        #         tax_all_levels,
+                        #     )
+                        # },
+                        "label_all_levels": tax_all_levels,
+                        "split": meta_plate["split"][self.amplicon_type],
+                    }
+                )
+            if not rows:
+                continue
+            df_plate = pd.DataFrame(rows)
+            # transform isolate coords on to the frame of RGB.
+            # We assume all samples have RGB images.
+            # Coords in HSI frame are calculated later in the step of calculating
+            # randomness.
+            if func_transform_iso2rgb:
+                df_plate[["coord_x_rgb", "coord_y_rgb"]] = func_transform_iso2rgb(
+                    df_plate[["coord_x", "coord_y"]].to_numpy()
+                )
+            else:
+                df_plate[["coord_x_rgb", "coord_y_rgb"]] = None
+            dfs_proj.append(df_plate)
+            # if func_transform_rgb2hsi:
+            #     if func_transform_iso2rgb is None:
+            #         raise NotImplementedError(
+            #             "RGB must be available to transform to HSI"
+            #         )
+            #     df_plate[["coord_x_hsi", "coord_y_hsi"]] = func_transform_rgb2hsi(
+            #         df_plate[["coord_x_rgb", "coord_y_rgb"]].to_numpy()
+            #     )
+            # else:
+            #     df_plate[["coord_x_hsi", "coord_y_hsi"]] = None
+
+        df_proj = pd.concat(dfs_proj).reset_index(drop=True)
+        df_proj["split"] = df_proj["split"].replace("val", "val_mid")
+        train_split_idx = df_proj.query("split == 'train'").index
+        if len(train_split_idx) > 0:
+            rng = np.random.default_rng(random_seed)
+            df_proj.loc[
+                rng.choice(
+                    train_split_idx,
+                    size=int(len(df_proj) * self.val_easy_ratio),
+                    replace=False,
+                ),
+                "split",
+            ] = "val_easy"
+        return df_proj
 
     def _fit_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add another column `_label` to self.df_train which is an integer
@@ -1504,7 +1518,7 @@ class TAMPICDataModule(L.LightningDataModule):
         # [num_levels, num_rows]
         label_clean_idx_all_levels_arr = np.array(label_clean_idx_all_levels).T
         df["label_all_levels_clean_idx"] = pd.Series(
-            [i for i in label_clean_idx_all_levels_arr]
+            [i for i in label_clean_idx_all_levels_arr], index=df.index
         )
         return df
 
@@ -1835,7 +1849,7 @@ if __name__ == "__main__":
                 _hsi_wavelengths_overwrite=[],
             )
             dm.setup()
-            dl_train = dm.val_dataloader()[0]
+            dl_train = dm.val_dataloader()[1]
             t1 = time.perf_counter()
             rprint(f"Time to setup data module: {t1 - t0:.2f} s")
             first_sample = next(iter(dl_train))

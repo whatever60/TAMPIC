@@ -1,0 +1,42 @@
+{
+  "weight_by_label": true,
+  "weight_by_plate": false,
+  "weight_by_density": true,
+  "weight_density_kernel_size": 100,
+  "p_num_igs": {
+    "1": 0.3,
+    "2": 0.7,
+    "3": 0
+  },
+  "p_igs": {
+    "rgb-red": 1,
+    "rgb-white": 2,
+    "hsi": 0
+  },
+  "p_last_time_point": 0.6,
+  "p_hsi_channels": 0,
+  "p_num_igs_val": {
+    "1": 0,
+    "2": 1,
+    "3": 0
+  },
+  "p_igs_val": {
+    "rgb-red": 1,
+    "rgb-white": 1,
+    "hsi": 0
+  },
+  "p_last_time_point_val": 1,
+  "p_hsi_channels_val": 0,
+  "crop_size_init": {
+    "rgb-red": 128,
+    "rgb-white": 128,
+    "hsi": 91
+  },
+  "crop_size_final": 128,
+  "keep_empty": false,
+  "keep_others": false,
+  "pretrained": true,
+  "_pretrained_hsi_base": true,
+  "_norm_and_sum": true,
+  "_hsi_wavelengths_overwrite": []
+}

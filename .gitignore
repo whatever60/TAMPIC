@@ -1,3 +1,10 @@
+notebooks/
+tb_logs/
+data/
+.vscode/
+_*.ipynb
+figs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

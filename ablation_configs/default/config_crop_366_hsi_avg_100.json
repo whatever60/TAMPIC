@@ -1,0 +1,42 @@
+{
+    "weight_by_label": true,
+    "weight_by_plate": false,
+    "weight_by_density": true,
+    "weight_density_kernel_size": 100,
+    "p_num_igs": {
+        "1": 2,
+        "2": 2,
+        "3": 1
+    },
+    "p_igs": {
+        "rgb-red": 2,
+        "rgb-white": 3,
+        "hsi": 1
+    },
+    "p_last_time_point": 0.6,
+    "p_hsi_channels": 0.2,
+    "p_num_igs_val": {
+        "1": 0,
+        "2": 0,
+        "3": 1
+    },
+    "p_igs_val": {
+        "rgb-red": 1,
+        "rgb-white": 1,
+        "hsi": 1
+    },
+    "p_last_time_point_val": 1,
+    "p_hsi_channels_val": 1,
+    "crop_size_init": {
+        "rgb-red": 512,
+        "rgb-white": 512,
+        "hsi": 366
+    },
+    "crop_size_final": 96,
+    "keep_empty": false,
+    "keep_others": true,
+    "pretrained": true,
+    "_pretrained_hsi_base": true,
+    "_norm_and_sum": true,
+    "_hsi_avg_dim": 100
+}
