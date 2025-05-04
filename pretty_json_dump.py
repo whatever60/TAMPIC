@@ -1,6 +1,7 @@
 """
-https://gist.github.com/jannismain/e96666ca4f059c3e5bc28abb711b5c92 
+https://gist.github.com/jannismain/e96666ca4f059c3e5bc28abb711b5c92
 """
+
 import json
 
 
@@ -105,3 +106,11 @@ class CompactJSONEncoder(json.JSONEncoder):
             raise ValueError(
                 f"indent must either be of type int or str (is: {type(self.indent)})"
             )
+
+
+def reformat_json(path):
+    with open(path) as f:
+        data = json.load(f)
+
+    with open(path, "w") as f:
+        json.dump(data, f, cls=CompactJSONEncoder)

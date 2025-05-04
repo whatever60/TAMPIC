@@ -12,30 +12,29 @@ from lightning.pytorch.callbacks import (
     ModelSummary,
 )
 
-from ema import EMA
+from tampic.ema import EMA
+from tampic.models.models import TAMPICResNetLightningModule
+from tampic.datasets import TAMPICDataModule
 
-# from ema_new import EMA
-from models import TAMPICResNetLightningModule
-from datasets import TAMPICDataModule
 
 L.seed_everything(42)
-
 
 base_dir = "/mnt/c/aws_data/data/camii"
 base_dir = "/home/ubuntu/data/camii"
 
 # hparams
-lr = 3e-3
-max_epochs = 1000
-num_batches_per_epoch = 200
+lr = 2e-3
+max_epochs = 30
+num_batches_per_epoch = 1000
 num_devices = 1
-batch_size = 32  # per device batch size before gradient accumulation
-grad_accum = 8
+batch_size = 64  # per device batch size before gradient accumulation
+grad_accum = 2
+num_samples_per_epoch = num_batches_per_epoch * batch_size * num_devices
 total_steps = math.ceil(max_epochs * num_batches_per_epoch / grad_accum)
 warmup_steps = 2000
-check_val_every_n_epoch = 10
-checkpoint_every_n_epoch = 50
-amplicon_type, taxon_level = "16s", "genus"
+check_val_every_n_epoch = 1
+checkpoint_every_n_epoch = 5
+# amplicon_type, taxon_level = "16s", "genus"
 
 # the ratio of rgb crop size and hsi crop size should be roughly 1296 : 926 = 7 : 5 = 1.4
 crop_size_init = {
@@ -248,6 +247,18 @@ def load_config(config_arg) -> dict:
 parser = argparse.ArgumentParser(description="Train a model")
 parser.add_argument("--data", type=str, default="all_0531.json")
 parser.add_argument(
+    "--amplicon_type",
+    type=str,
+    default="16s",
+    choices=["16s", "its"],
+)
+parser.add_argument(
+    "--taxon_level",
+    type=str,
+    default="genus",
+    choices=["domain", "phylum", "class", "order", "family", "genus", "species"],
+)
+parser.add_argument(
     "--config",
     type=str,
     help="Path to the configuration file or a predefined config name",
@@ -279,8 +290,8 @@ dm = TAMPICDataModule(
     p_last_time_point_val=train_config_mode["p_last_time_point_val"],
     p_hsi_channels_val=train_config_mode["p_hsi_channels_val"],
     #
-    amplicon_type=amplicon_type,
-    taxon_level=taxon_level,
+    amplicon_type=args.amplicon_type,
+    taxon_level=args.taxon_level,
     min_counts=10,
     min_counts_dominate=0,
     min_ratio=2,
@@ -298,59 +309,76 @@ dm = TAMPICDataModule(
     # _hsi_group_k=3,
     _hsi_crop_size=196,
     _hsi_norm=True,
-    _hsi_avg_dim=train_config_mode.get("_hsi_avg_dim", None),
+    # _hsi_avg_dim=train_config_mode.get("_hsi_avg_dim", None),
     _couple_rgb=True,
     _hsi_wavelengths_overwrite=train_config_mode.get("_hsi_wavelengths_overwrite"),
 )
 dm.setup()
 
 # setup callbacks
-# today = datetime.today()
-# logger = TensorBoardLogger(
-#     "tb_logs",
-#     name=f"{today.strftime('%Y%m%d')}_TAMPIC_{amplicon_type}_{taxon_level}_{args.name}",
-# )
-# lr_monitor = LearningRateMonitor(logging_interval="step")
-# ckpt_callback = ModelCheckpoint(
-#     # monitor="val_easy_acc/dataloader_idx_0",
-#     monitor="val-easy_top1_acc",
-#     filename="{epoch}-{step}-{val-easy_top1_acc:.2f}-{val-easy_top3_acc:.2f}",
-#     mode="max",
-#     save_top_k=-1,
-#     save_last=True,
-#     every_n_epochs=checkpoint_every_n_epoch,
-# )
-# ema_callback = EMA(decay=0.999)
-# model_summary_callback = ModelSummary(max_depth=2)
+today = datetime.today()
+logger = TensorBoardLogger(
+    "tb_logs",
+    # name=f"{today.strftime('%Y%m%d')}_TAMPIC_{os.path.splitext(args.data)[0]}_"
+    # f"{amplicon_type}_{taxon_level}_{args.name}",
+    name="-".join(
+        [
+            today.strftime("%Y%m%d"),
+            "TAMPIC",
+            os.path.splitext(args.data)[0],
+            args.amplicon_type,
+            args.taxon_level,
+            args.name,
+        ]
+    ),
+)
+lr_monitor = LearningRateMonitor(logging_interval="step")
+ckpt_callback = ModelCheckpoint(
+    # monitor="val_easy_acc/dataloader_idx_0",
+    monitor="val-easy_top1_acc",
+    filename="{epoch}-{step}-{val-easy_top1_acc:.2f}-{val-easy_top3_acc:.2f}",
+    mode="max",
+    save_top_k=-1,
+    save_last=True,
+    every_n_epochs=checkpoint_every_n_epoch,
+)
+ema_callback = EMA(decay=0.999)
+model_summary_callback = ModelSummary(max_depth=2)
 
-# # Create the model
-# model = TAMPICResNetLightningModule(
-#     model_type="resnet18",
-#     num_classes=len(dm.label_clean2idx),
-#     lr=lr,
-#     pretrained=train_config_mode["pretrained"],
-#     warmup_steps=warmup_steps,
-#     total_steps=total_steps,
-#     batch_size=batch_size,
-#     wavelengths=dm._hsi_wavelengths,
-#     _pretrained_hsi_base=train_config_mode.get("_pretrained_hsi_base", False),
-#     _norm_and_sum=train_config_mode.get("_norm_and_sum", False),
-#     _prediction_log_dir=os.path.join(logger.log_dir, "predictions"),
-# )
+# Create the model
+model = TAMPICResNetLightningModule(
+    model_type="resnet18",
+    # num_classes=len(dm.label_clean2idx),
+    lr=lr,
+    pretrained=train_config_mode["pretrained"],
+    warmup_steps=warmup_steps,
+    total_steps=total_steps,
+    batch_size=batch_size,
+    hsi_avg_dim=train_config_mode.get("hsi_avg_dim", None),
+    wavelengths=dm._hsi_wavelengths,
+    _pretrained_hsi_base=train_config_mode.get("_pretrained_hsi_base", False),
+    _norm_and_sum=train_config_mode.get("_norm_and_sum", False),
+    _prediction_log_dir=os.path.join(logger.log_dir, "predictions"),
+    _multi_level_aux_loss_weight=train_config_mode.get(
+        "_multi_level_aux_loss_weight", 0.0
+    ),
+    _multi_level_label_clean2idx=dm.label_clean2idx_all,
+    label_clean2idx=dm.label_clean2idx,
+)
 
-# # Initialize the Trainer
-# trainer = L.Trainer(
-#     logger=logger,
-#     callbacks=[lr_monitor, ckpt_callback, ema_callback, model_summary_callback],
-#     max_epochs=max_epochs,
-#     accumulate_grad_batches=grad_accum,
-#     reload_dataloaders_every_n_epochs=1,
-#     check_val_every_n_epoch=check_val_every_n_epoch,
-#     num_sanity_val_steps=0,
-#     devices=num_devices,  # if using GPU
-# )
-# trainer.fit(
-#     model,
-#     datamodule=dm,
-#     # ckpt_path="/home/ubuntu/dev/tampic/tb_logs/20250425_TAMPIC_16s_genus_pretrained-large_data-rgb_only-no_empty-no_others-weight_density-128/version_1/checkpoints/last.ckpt",
-# )
+# Initialize the Trainer
+trainer = L.Trainer(
+    logger=logger,
+    callbacks=[lr_monitor, ckpt_callback, ema_callback, model_summary_callback],
+    max_epochs=max_epochs,
+    accumulate_grad_batches=grad_accum,
+    reload_dataloaders_every_n_epochs=1,
+    check_val_every_n_epoch=check_val_every_n_epoch,
+    num_sanity_val_steps=0,
+    devices=num_devices,  # if using GPU
+)
+trainer.fit(
+    model,
+    datamodule=dm,
+    # ckpt_path="/home/ubuntu/dev/tampic/tb_logs/20250425_TAMPIC_16s_genus_pretrained-large_data-rgb_only-no_empty-no_others-weight_density-128/version_1/checkpoints/last.ckpt",
+)
