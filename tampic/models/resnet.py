@@ -260,37 +260,48 @@ class TAMPICResNet(ResNet):
 
     @staticmethod
     def get_nonzero(data: dict, image_group: str) -> torch.Tensor:
+        # 1 means available, 0 means not available
         return (data[image_group]["available"] & (~data[image_group]["dropped"])).int()
 
     def _forward_base_norm_and_sum(
         self, data: dict, wavelengths: torch.Tensor
     ) -> torch.Tensor:
         xs = []
-        tms = []
-        for ig in self.image_groups:  # loop over image groups (modalities)
+
+        for ig in data:  # loop over image groups (modalities)
             avail = self.get_nonzero(data, ig)
-
-            # add target mask
-            target_mask = data[ig]["target_mask"]
-            target_mask *= avail.view(-1, 1, 1)
-            tms.append(target_mask)
-
             if (avail == 0).all():
                 # Skip the image group if it's not available for the entire batch, but
                 # target mask is still added above
                 continue
+            # add target mask
+            target_mask = data[ig]["target_mask"][avail]  # [batch_size, h, w]
+
+            # NOTE: Here we do this kind of awkward operation so that the shape of 
+            # target mask conv layer is consistent with old implementation. Then old 
+            # checkpoint can still be loaded.
+            ig_idx = self.image_groups.index(ig)
+            out_mask = self.bn1_target_mask(F.conv2d(
+                target_mask.unsqueeze(1),
+                self.conv1_target_mask.weight[:, ig_idx:ig_idx + 1],
+                bias=None,
+                stride=self.conv1_target_mask.stride,
+                padding=self.conv1_target_mask.padding,
+                dilation=self.conv1_target_mask.dilation,
+            ))
 
             # forward conv layer
             bn1_layer = getattr(self, f"bn1_{ig}".replace("-", "_"))
             conv1_layer = getattr(self, f"conv1_{ig}".replace("-", "_"))
             if ig == "hsi":
-                out = bn1_layer(conv1_layer(data[ig]["image"], wavelengths))
+                out = bn1_layer(conv1_layer(data[ig]["image"][avail], wavelengths))
             else:
-                out = bn1_layer(conv1_layer(data[ig]["image"]))
-            out *= avail.view(-1, 1, 1, 1)
-            xs.append(out)
+                out = bn1_layer(conv1_layer(data[ig]["image"][avail]))
+            batch_size = data[ig]["image"].shape[0]
+            out_all = torch.zeros(batch_size, *out.shape[1:], device=out.device)
+            out_all[avail] = out + out_mask
+            xs.append(out_all)
 
-        xs.append(self.bn1_target_mask(self.conv1_target_mask(torch.stack(tms, dim=1))))
         x = torch.stack(xs).sum(0)
         x = self.relu(x)
         x = self.maxpool(x)
@@ -299,25 +310,29 @@ class TAMPICResNet(ResNet):
     def _forward_base_sum_and_norm(
         self, data: dict, wavelengths: torch.Tensor
     ) -> torch.Tensor:
-        xs = []
-        tms = []
-        for ig in self.image_groups:
-            # if data[ig]["available"] and not data[ig]["dropped"]:
-            # if ig == "hsi":
-            #     xs.append(self.conv1_hsi(data[ig]["image"], wavelengths))
-            # else:
-            xs.append(
-                getattr(self, f"conv1_{ig}".replace("-", "_"))(
-                    data[ig]["image"], wavelengths
-                )
-            )
-            tms.append(data[ig]["target_mask"])
-        xs.append(self.conv1_target_mask(torch.stack(tms, dim=1)))
-        x = torch.stack(xs).sum(0)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-        return x
+        # NOTE: deprecated
+        raise NotImplementedError(
+            "This method is deprecated. Use _forward_base_norm_and_sum instead."
+        )
+        # xs = []
+        # tms = []
+        # for ig in data:
+        #     # if data[ig]["available"] and not data[ig]["dropped"]:
+        #     # if ig == "hsi":
+        #     #     xs.append(self.conv1_hsi(data[ig]["image"], wavelengths))
+        #     # else:
+        #     xs.append(
+        #         getattr(self, f"conv1_{ig}".replace("-", "_"))(
+        #             data[ig]["image"], wavelengths
+        #         )
+        #     )
+        #     tms.append(data[ig]["target_mask"])
+        # xs.append(self.conv1_target_mask(torch.stack(tms, dim=1)))
+        # x = torch.stack(xs).sum(0)
+        # x = self.bn1(x)
+        # x = self.relu(x)
+        # x = self.maxpool(x)
+        # return x
 
     def _forward_stem(self, x: torch.Tensor) -> torch.Tensor:
         x = self.layer1(x)
