@@ -270,7 +270,7 @@ class HSConvGating(HSConvBase):
 
     def forward(self, x: torch.Tensor, wavelengths: torch.Tensor) -> torch.Tensor:
         b, _, h, w = x.shape
-        x, wavelengths = self.aap(x, wavelengths)
+        x, wavelengths = self.aap(x, wavelengths)  # [b, in_channels, h, w]
         x = self.proj_x(x.permute(2, 3, 0, 1))  # [h, w, b, hidden_dims[-1]]
         gate = self.proj_gate(wavelengths)  # [b, hidden_dims[-1]]
         # [h, w, b, hidden_dims[-1]]

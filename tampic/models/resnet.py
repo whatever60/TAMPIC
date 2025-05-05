@@ -266,16 +266,20 @@ class TAMPICResNet(ResNet):
     def _forward_base_norm_and_sum(
         self, data: dict, wavelengths: torch.Tensor
     ) -> torch.Tensor:
-        xs = []
+        TAKE_OUT_AVAIL = False
 
+        xs = []
         for ig in data:  # loop over image groups (modalities)
             avail = self.get_nonzero(data, ig)
             if (avail == 0).all():
                 # Skip the image group if it's not available for the entire batch, but
                 # target mask is still added above
                 continue
-            # add target mask
-            target_mask = data[ig]["target_mask"][avail]  # [batch_size, h, w]
+
+            batch_size = avail.shape[0]
+            if TAKE_OUT_AVAIL:
+                target_mask = data[ig]["target_mask"][avail]  # [batch_size, h, w]
+                image = data[ig]["image"][avail]  # [batch_size, c, h, w]
 
             # NOTE: Here we do this kind of awkward operation so that the shape of 
             # target mask conv layer is consistent with old implementation. Then old 
@@ -294,12 +298,15 @@ class TAMPICResNet(ResNet):
             bn1_layer = getattr(self, f"bn1_{ig}".replace("-", "_"))
             conv1_layer = getattr(self, f"conv1_{ig}".replace("-", "_"))
             if ig == "hsi":
-                out = bn1_layer(conv1_layer(data[ig]["image"][avail], wavelengths))
+                out = bn1_layer(conv1_layer(image, wavelengths))
             else:
-                out = bn1_layer(conv1_layer(data[ig]["image"][avail]))
-            batch_size = data[ig]["image"].shape[0]
-            out_all = torch.zeros(batch_size, *out.shape[1:], device=out.device)
-            out_all[avail] = out + out_mask
+                out = bn1_layer(conv1_layer(image))
+            
+            if TAKE_OUT_AVAIL:
+                out_all = torch.zeros(batch_size, *out.shape[1:], device=out.device)
+                out_all[avail] += out + out_mask
+            else:
+                out_all = out + out_mask
             xs.append(out_all)
 
         x = torch.stack(xs).sum(0)
