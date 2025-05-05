@@ -118,10 +118,10 @@ class ImageDataset(Dataset):
             image_groups if image_groups is not None else self.image_groups_default
         )
         if isinstance(crop_size_init, int):
-            crop_size_init = {k: crop_size_init for k in self.image_groups}
+            crop_size_init = {k: crop_size_init for k in self.image_groups_default}
         self.crop_size_init = crop_size_init
         if isinstance(crop_size_final, int):
-            crop_size_final = {k: crop_size_final for k in self.image_groups}
+            crop_size_final = {k: crop_size_final for k in self.image_groups_default}
         self.crop_size_final = crop_size_final
         self.hsi_wavelengths = hsi_wavelengths
         self.hsi_ceil = hsi_ceil
@@ -761,7 +761,7 @@ class TAMPICDataModule(L.LightningDataModule):
             hsi_wavelengths=self.hsi_wavelengths,
             hsi_ceil=self.hsi_ceil,
             split="train",
-            image_groups=[ig for ig, p in self.p_igs.items() if p == 0],
+            image_groups=[ig for ig, p in self.p_igs.items() if p > 0],
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
             _calc_stats_mode=self._calc_stats_mode,
@@ -796,7 +796,7 @@ class TAMPICDataModule(L.LightningDataModule):
             hsi_wavelengths=self.hsi_wavelengths,
             hsi_ceil=self.hsi_ceil,
             split="val",
-            image_groups=[ig for ig, p in self.p_igs_val.items() if p == 0],
+            image_groups=[ig for ig, p in self.p_igs_val.items() if p > 0],
             _hsi_group_k=self._hsi_group_k,
             _hsi_crop_size=self._hsi_crop_size,
             _hsi_avg_dim=self._hsi_avg_dim,
