@@ -9,30 +9,21 @@ import json
 import os
 
 import numpy as np
-import pandas as pd
 from tqdm.auto import tqdm
 from joblib import Parallel, delayed
 
-from affine_transform import get_query2target_func
-from hsi_breakdown import read_npz_file_and_crop
-from crop_image import crop_image
+from tampic.utils.affine_transform import get_query2target_func
+from tampic.utils.hsi_breakdown import read_npz_file_and_crop
+from tampic.utils.crop_image import crop_image
 
 base_dir = "/home/ubuntu/data/camii"
 hsi_dir = "hyperspectral"
 hsi_plate_dec_dir = "hyperspectral_plate_detection"
 metadata_path = "all_0531.json"
-size = 512
+size = 366
 
 with open(f"{base_dir}/{metadata_path}") as f:
     metadata = json.load(f)
-
-global_properties = metadata["global_properties"]
-num_hsi_channels = global_properties["hsi_num_channels"]
-hsi_wavelengths = np.loadtxt(
-    os.path.join(base_dir, global_properties["hsi_wavelengths"])
-)
-hsi_ceil = global_properties["hsi_ceil"]
-stats = global_properties["stats"]
 
 dfs = []
 for proj, meta_proj in metadata["data"].items():
@@ -63,12 +54,19 @@ for proj, meta_proj in metadata["data"].items():
             continue
         for time_point_info in time_points_hsi.values():
             dir_ = time_point_info["dir"]
+            os.makedirs(dir_, exist_ok=True)
             transform_params = time_point_info["transform"]
-            hsi_npz_path = os.path.join(
-                dir_, "..", "..", hsi_dir, f"{os.path.basename(dir_)}.npz"
+            hsi_npz_path = os.path.abspath(
+                os.path.join(dir_, "..", "..", hsi_dir, f"{os.path.basename(dir_)}.npz")
             )
-            hsi_plate_annot_path = os.path.join(
-                dir_, "..", "..", hsi_plate_dec_dir, f"{os.path.basename(dir_)}_rgb.txt"
+            hsi_plate_annot_path = os.path.abspath(
+                os.path.join(
+                    dir_,
+                    "..",
+                    "..",
+                    hsi_plate_dec_dir,
+                    f"{os.path.basename(dir_)}_rgb.txt",
+                )
             )
             # hsi_npz = np.load(hsi_npz_path)["data"]
             hsi_npz = read_npz_file_and_crop(

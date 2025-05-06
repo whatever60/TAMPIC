@@ -6,16 +6,15 @@ import numpy as np
 import imageio
 import cv2 as cv
 from joblib import Parallel, delayed
-from tqdm.auto import tqdm, trange
+from tqdm.auto import trange
 
 from hsi_crop import parse_yolo_annotation
 
-sys.path.append("/home/ubuntu/dev/CAMII_dev")
 
-from data_transform import _crop_array
+from .hyperspectral_processing import _crop_array
 
 
-def read_npz_file_and_crop(input_npz_path: str, plate_annot: str=None) -> np.ndarray:
+def read_npz_file_and_crop(input_npz_path: str, plate_annot: str = None) -> np.ndarray:
     """
     Read a 3D tensor from a .npz file and crop it according to the YOLO annotation.
 
@@ -39,6 +38,7 @@ def read_npz_file_and_crop(input_npz_path: str, plate_annot: str=None) -> np.nda
 
     return tensor
 
+
 def save_grayscale_pngs_from_npz(
     input_npz_path: str,
     output_dir: str,
@@ -53,7 +53,7 @@ def save_grayscale_pngs_from_npz(
         output_dir (str): Directory where the output PNG files will be saved.
     """
     tensor = read_npz_file_and_crop(input_npz_path, plate_annot)
-    
+
     # Load the corresponding YAML file
     input_npz_base = os.path.splitext(os.path.basename(input_npz_path))[0]
     yaml_path = f"{os.path.splitext(input_npz_path)[0]}.yaml"
@@ -71,8 +71,8 @@ def save_grayscale_pngs_from_npz(
     for i in trange(0, len(wavelengths), max(1, k)):
         if k > 0:
             output_path = os.path.join(
-                    specific_output_dir, f"{'_'.join(map(str, wavelengths[i:i+k]))}.tif"
-                )
+                specific_output_dir, f"{'_'.join(map(str, wavelengths[i : i + k]))}.tif"
+            )
             cv.imwrite(output_path, tensor[:, :, i : i + k])
         else:
             output_path = os.path.join(specific_output_dir, f"{wavelengths[i]}.png")
